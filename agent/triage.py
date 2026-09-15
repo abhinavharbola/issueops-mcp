@@ -33,13 +33,68 @@ def _issue_plaintext(issue: dict) -> str:
     return f"{issue.get('title', '')} {issue.get('body') or ''} {comments_text}"
 
 
+EMPTY_CLASSIFICATION = {
+    "labels_to_add": [],
+    "comment": None,
+    "close_reason": None,
+    "assign_to": None,
+    "rationale": None,
+}
+
+
+def _empty_classification(rationale: str) -> dict:
+    return {**EMPTY_CLASSIFICATION, "labels_to_add": [], "rationale": rationale}
+
+
+def _sanitize_classification(data) -> dict:
+    if not isinstance(data, dict):
+        raise ValueError("classification is not a JSON object")
+
+    dropped = []
+
+    labels = data.get("labels_to_add") or []
+    if not isinstance(labels, list) or not all(isinstance(l, str) for l in labels):
+        dropped.append("labels_to_add")
+        labels = []
+
+    comment = data.get("comment")
+    if comment is not None and not isinstance(comment, str):
+        dropped.append("comment")
+        comment = None
+
+    close_reason = data.get("close_reason")
+    if close_reason not in tools.VALID_CLOSE_REASONS:
+        dropped.append(f"close_reason={close_reason!r}")
+        close_reason = None
+
+    assign_to = data.get("assign_to")
+    if assign_to is not None and not isinstance(assign_to, str):
+        dropped.append("assign_to")
+        assign_to = None
+
+    rationale = data.get("rationale")
+    rationale = rationale if isinstance(rationale, str) else None
+    if dropped:
+        note = f"dropped malformed field(s): {', '.join(dropped)}"
+        rationale = f"{rationale} | {note}" if rationale else note
+
+    return {
+        "labels_to_add": labels,
+        "comment": comment,
+        "close_reason": close_reason,
+        "assign_to": assign_to,
+        "rationale": rationale,
+    }
+
+
 def _parse_classification(raw_text: str) -> dict:
     cleaned = raw_text.strip()
     if cleaned.startswith("```"):
         cleaned = cleaned.strip("`")
         if cleaned.startswith("json"):
             cleaned = cleaned[4:]
-    return json.loads(cleaned)
+    parsed = json.loads(cleaned)
+    return _sanitize_classification(parsed)
 
 
 def build_groq_clients(config: Config) -> list[Groq]:
@@ -89,11 +144,11 @@ def classify_issue(groq_clients: list[Groq], model: str, issue: dict) -> dict:
     )
     raw_text = response.choices[0].message.content
     if not raw_text:
-        return {"labels_to_add": [], "comment": None, "close_reason": None, "assign_to": None, "rationale": "empty model output"}
+        return _empty_classification("empty model output")
     try:
         return _parse_classification(raw_text)
-    except json.JSONDecodeError:
-        return {"labels_to_add": [], "comment": None, "close_reason": None, "assign_to": None, "rationale": "unparseable model output"}
+    except (json.JSONDecodeError, ValueError) as exc:
+        return _empty_classification(f"unparseable model output: {exc}")
 
 
 def _plan_from_classification(classification: dict, repo: str, issue_number: int) -> list[tuple[str, dict]]:
@@ -131,31 +186,42 @@ def run_triage(repo: str, initiator: str, state: str = "open", max_issues: int |
             continue
 
         issue_number = summary["number"]
-        issue = tools.get_issue(dsn, read_client, repo, issue_number, initiator)
-        flagged = is_heuristically_flagged(_issue_plaintext(issue))
-        classification = classify_issue(groq_clients, model, issue)
-        plan = _plan_from_classification(classification, repo, issue_number)
+        try:
+            issue = tools.get_issue(dsn, read_client, repo, issue_number, initiator)
+            flagged = is_heuristically_flagged(_issue_plaintext(issue))
+            classification = classify_issue(groq_clients, model, issue)
+            plan = _plan_from_classification(classification, repo, issue_number)
 
-        proposals = []
-        for tool_name, args in plan:
-            dedup_key = (tool_name, repo, issue_number, json.dumps(args, sort_keys=True))
-            if dedup_key in already_called:
-                continue
-            already_called.add(dedup_key)
-            try:
-                proposal = PROPOSE_DISPATCH[tool_name](dsn, read_client, repo, issue_number, args, initiator, flagged)
-                proposals.append({"tool_name": tool_name, "result": proposal})
-            except tools.ValidationError as exc:
-                proposals.append({"tool_name": tool_name, "error": str(exc)})
+            proposals = []
+            for tool_name, args in plan:
+                dedup_key = (tool_name, repo, issue_number, json.dumps(args, sort_keys=True))
+                if dedup_key in already_called:
+                    continue
+                already_called.add(dedup_key)
+                try:
+                    proposal = PROPOSE_DISPATCH[tool_name](dsn, read_client, repo, issue_number, args, initiator, flagged)
+                    proposals.append({"tool_name": tool_name, "result": proposal})
+                except tools.ValidationError as exc:
+                    proposals.append({"tool_name": tool_name, "error": str(exc)})
 
-        results.append(
-            {
-                "issue_number": issue_number,
-                "heuristic_flagged": flagged,
-                "classification": classification,
-                "proposals": proposals,
-            }
-        )
+            results.append(
+                {
+                    "issue_number": issue_number,
+                    "heuristic_flagged": flagged,
+                    "classification": classification,
+                    "proposals": proposals,
+                }
+            )
+        except Exception as exc:
+            results.append(
+                {
+                    "issue_number": issue_number,
+                    "heuristic_flagged": None,
+                    "classification": None,
+                    "proposals": [],
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
 
     return results
 

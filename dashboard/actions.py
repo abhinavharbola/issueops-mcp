@@ -36,7 +36,19 @@ def _execute_on_github(write_client: GitHubWriteClient, tool_name: str, repo: st
     if tool_name == "propose_add_labels":
         return write_client.add_labels(repo, issue_number, arguments["labels"])
     if tool_name == "propose_remove_labels":
-        return [write_client.remove_label(repo, issue_number, label) for label in arguments["labels"]]
+        removed = []
+        for label in arguments["labels"]:
+            try:
+                write_client.remove_label(repo, issue_number, label)
+                removed.append(label)
+            except Exception as exc:
+                attempted = removed + [label]
+                not_attempted = [l for l in arguments["labels"] if l not in attempted]
+                detail = f"removed {removed} before failing on {label!r} ({exc})"
+                if not_attempted:
+                    detail += f"; never attempted {not_attempted}"
+                raise RuntimeError(detail) from exc
+        return removed
     if tool_name == "propose_assign":
         return write_client.assign(repo, issue_number, arguments["assignee"])
     if tool_name == "propose_close":

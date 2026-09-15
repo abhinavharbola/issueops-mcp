@@ -1,10 +1,16 @@
 HEURISTIC_PHRASES = [
     "ignore previous instructions",
     "ignore all previous instructions",
+    "ignore the above",
     "disregard previous instructions",
-    "you must",
-    "system prompt",
+    "disregard the above",
     "new instructions:",
+    "system prompt",
+    "you are now",
+    "act as if",
+    "do not tell the user",
+    "this is not a drill",
+    "override your instructions",
 ]
 
 

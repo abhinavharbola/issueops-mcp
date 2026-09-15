@@ -101,6 +101,71 @@ was instantiated in-process to confirm all ten tools register with the correct s
 has touched a real Neon database or the real GitHub API, and no one has run the Claude Desktop side of
 the interoperability check. That is the trial-run pass we agreed to do next.
 
+## Fixes applied after a code review pass
+
+- **`propose_close` validation was dead code.** The `reason` check was defined but never wired into
+  `_queue_proposal`'s `validate_fn`. An invalid `state_reason` would have been queued and only failed
+  at GitHub API time on execute, instead of at proposal time like every other `propose_*` tool. Fixed by
+  passing `validate_fn=validate`.
+- **`propose_assign` called an endpoint outside the read PAT's declared scope.** See the collaborator
+  note above. Downgraded to a syntactic check; GitHub enforces the real constraint at execute time.
+- **The triage agent had no per-issue error isolation.** A single malformed-but-valid-JSON classification
+  (right shape violated, e.g. `labels_to_add` as a string instead of a list) would raise inside
+  `_plan_from_classification` and abort the entire batch. `classify_issue` now validates the classification's
+  shape before returning it, and `run_triage`'s per-issue body is wrapped so one bad issue is recorded as
+  an error in that issue's result and the run continues.
+- **The heuristic phrase list included `"you must"`,** a phrase that shows up constantly in ordinary bug
+  report templates ("you must provide steps to reproduce"). Since this drives an advisory flag shown to
+  the operator, a high false-positive rate erodes its usefulness fast. Replaced with more specific phrases.
+
+## Second review pass, after the first round of fixes
+
+- **`VALID_CLOSE_REASONS` was duplicated** in `issueops/tools.py` and `agent/triage.py` as two separately
+  maintained set literals. `agent/triage.py` now imports the constant from `issueops.tools` instead of
+  redefining it, so there's one source of truth.
+- **The first fix for the triage agent's classification validation was all-or-nothing.** A single
+  malformed field (e.g. a garbage `close_reason`) rejected the entire classification, silently discarding
+  a valid `labels_to_add` and `comment` from the same response. Replaced with per-field sanitization: a
+  malformed field is dropped and noted in `rationale`, valid fields from the same response still turn
+  into proposals. The classification is only rejected outright if the model's output isn't a JSON object
+  at all. Verified with a scripted test: a response with a valid label and comment but a garbage
+  `close_reason` now still produces `propose_add_labels` and `propose_add_comment`, where the previous
+  fix produced neither.
+- Verified with scripted mocks (not against live GitHub or Neon, that's still the pending trial run):
+  `propose_close` rejects an invalid `reason` and accepts a valid one, `propose_assign` rejects an empty
+  or malformed login and accepts a well-formed one, and `run_triage` isolates a per-issue failure
+  (simulated Groq exception on one issue in a three-issue batch) without dropping the other two issues'
+  results.
+
+## Third review pass
+
+- **`propose_remove_labels` could misreport a partial GitHub mutation as a clean failure.** GitHub has no
+  batch label-removal endpoint, so multi-label removal is N sequential DELETE calls. If label 2 of 3
+  failed (already removed by someone else, permissions, rate limit), the old code raised a bare exception
+  and the whole action was marked `failed` in `pending_actions` and `audit_log`, with no record that label
+  1 had, in fact, already been removed from GitHub. That's a real gap against Section 11.2's premise that
+  `audit_log` is the ground truth for what happened. `_execute_on_github` now tracks which labels
+  succeeded before a failure and puts that in the exception message, so `failure_reason` reads e.g.
+  `"removed ['bug'] before failing on 'wontfix' (404: label not found); never attempted ['duplicate']"`
+  instead of just the raw 404 text. The `pending_actions.status` is still just `failed`, no new status was
+  added, this is a message-accuracy fix, not a schema change.
+- **A GitHub network failure (timeout, DNS, connection reset) bypassed `_translate_errors` entirely** in
+  `mcp_server/server.py`. Only `RepoNotAllowedError`, `ValidationError`, and `GitHubAPIError` (HTTP
+  4xx/5xx responses) were caught; a `requests.exceptions.ConnectionError` or `Timeout` propagated as a raw
+  exception to the MCP client instead of a clean `ToolError`. Now caught alongside the others and wrapped
+  with the same message pattern.
+- **Confirmed but deliberately not changed:** `_queue_proposal` calls `snapshot_issue_state`, which does
+  call GitHub's read API (via the read PAT) to populate the required `issue_state_snapshot` column.
+  Section 7.3's prose ("It never calls the GitHub API") is stricter than Section 9's own schema, which
+  makes `issue_state_snapshot` `NOT NULL` and can only be populated by reading the issue. Read Section
+  7.3's claim as "never calls GitHub's mutating endpoints," which is what the credential-level guarantee
+  in Section 6.3 is actually about, and what the code delivers.
+- **Confirmed but deliberately not changed:** `dashboard/actions.py::approve_action` holds a
+  `SELECT ... FOR UPDATE` row lock across two live network calls (the stale-state re-fetch and, on success,
+  the GitHub write call). For a single operator clicking Approve one at a time, this is harmless. It would
+  become a real bottleneck under concurrent approvers, which is explicitly out of scope (Section 4, Section
+  14: not multi-operator).
+
 ## Choices I made where the PRD was silent, stated rather than silently picked
 
 - **psycopg (v3), not asyncpg.** One driver covers the sync contexts (Streamlit, the interactive agent
@@ -119,6 +184,16 @@ the interoperability check. That is the trial-run pass we agreed to do next.
 - **`propose_close`'s `reason` is constrained to GitHub's actual `state_reason` enum** (`completed`,
   `not_planned`, or omitted) — the PRD's "reason" didn't specify this, but GitHub's API rejects anything
   else.
+- **`propose_assign` validates the assignee syntactically only** (non-empty, a well-formed GitHub login),
+  not against the repo's actual collaborator list. An earlier version called the collaborators endpoint,
+  but that requires member/admin-level permission the PRD's read PAT (Issues/PRs read only, Section 6.3)
+  doesn't grant. Rather than widen the PAT's scope past what the PRD specifies, invalid assignees are now
+  caught by GitHub itself at execute time, the same pattern already used for `propose_close`'s reason.
+- **`repo_allowlist.active` and `audit_log.pending_action_id`** are not in the PRD's Section 9 schema.
+  `active` lets a repo be deactivated without deleting its row (needed for the Section 7.4 "removed from
+  allowlist" re-check and for `pending_actions`' foreign key to still resolve for old rows). `pending_action_id`
+  is the join the eval's execution-level-guarantee query (Section 11.2) needs to tie an `audit_log` row
+  back to its approval. Both are additive, nothing in Section 9 was removed or changed.
 - **Triage agent's classification schema** (`labels_to_add`, `comment`, `close_reason`, `assign_to`) is
   my own vocabulary — the PRD didn't specify one. It doesn't exercise `propose_remove_labels`; that tool
   is only reachable by a human or Claude Desktop.
