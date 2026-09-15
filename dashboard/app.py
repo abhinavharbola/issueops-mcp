@@ -10,10 +10,12 @@ from issueops import tools
 from issueops.config import load_config
 from issueops.db import sync_connection
 from issueops.github_client import GitHubReadClient, GitHubWriteClient
+from issueops.observability import configure_logfire
 
 st.set_page_config(page_title="IssueOps MCP", layout="wide")
 
 config = load_config(require_write_pat=True)
+configure_logfire(config.logfire_token, service_name="issueops-dashboard")
 read_client = GitHubReadClient(config.github_read_pat)
 write_client = GitHubWriteClient(config.github_write_pat)
 

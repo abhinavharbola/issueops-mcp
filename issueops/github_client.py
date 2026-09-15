@@ -55,9 +55,6 @@ class GitHubReadClient(_BaseClient):
     def get_repo_labels(self, repo: str):
         return self._request("GET", f"/repos/{repo}/labels", params={"per_page": 100})
 
-    def get_repo_collaborators(self, repo: str):
-        return self._request("GET", f"/repos/{repo}/collaborators", params={"per_page": 100})
-
 
 class GitHubWriteClient(_BaseClient):
     def add_comment(self, repo: str, issue_number: int, body: str):

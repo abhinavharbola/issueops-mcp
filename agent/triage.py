@@ -9,6 +9,7 @@ from agent.prompts import SYSTEM_PROMPT, build_user_prompt
 from issueops import tools
 from issueops.config import Config, load_config
 from issueops.github_client import GitHubReadClient
+from issueops.observability import configure_logfire
 
 DEFAULT_MODEL = "openai/gpt-oss-20b"
 
@@ -170,6 +171,7 @@ def _plan_from_classification(classification: dict, repo: str, issue_number: int
 
 def run_triage(repo: str, initiator: str, state: str = "open", max_issues: int | None = None, model: str = DEFAULT_MODEL):
     config = load_config(require_write_pat=False)
+    configure_logfire(config.logfire_token, service_name="issueops-triage-agent")
     read_client = GitHubReadClient(config.github_read_pat)
     groq_clients = build_groq_clients(config)
 

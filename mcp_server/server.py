@@ -8,9 +8,11 @@ from mcp.server.mcpserver.exceptions import ToolError
 from issueops import tools
 from issueops.config import load_config
 from issueops.github_client import GitHubAPIError, GitHubReadClient
+from issueops.observability import configure_logfire
 from issueops.tools import RepoNotAllowedError, ValidationError
 
 config = load_config(require_write_pat=False)
+configure_logfire(config.logfire_token, service_name="issueops-mcp-server")
 read_client = GitHubReadClient(config.github_read_pat)
 initiator = "mcp:stdio"
 

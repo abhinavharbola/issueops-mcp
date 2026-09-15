@@ -16,7 +16,10 @@ async def main():
     arguments = json.loads(sys.argv[2]) if len(sys.argv) > 2 else {}
 
     server_params = StdioServerParameters(
-        command="python3",
+        # Use the same interpreter running this script instead of a hardcoded
+        # "python3", which is not guaranteed to exist on a stock Windows
+        # Python install (only "python"/"py" are).
+        command=sys.executable,
         args=["-m", "mcp_server.server"],
         env=dict(os.environ),
     )
