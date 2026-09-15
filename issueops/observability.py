@@ -14,6 +14,10 @@ def configure_logfire(token: str | None, service_name: str) -> None:
     Idempotent by design: dashboard/app.py re-runs top to bottom on every
     Streamlit interaction, so this must not re-configure or re-instrument
     on every click.
+
+    console=False is required for the MCP server: stdio transport uses
+    stdout for JSON-RPC framing, and Logfire's default console exporter
+    writes span/log lines directly to stdout, which corrupts that stream.
     """
     global _configured
     if not token:
@@ -31,7 +35,7 @@ def configure_logfire(token: str | None, service_name: str) -> None:
         return
 
     try:
-        logfire.configure(token=token, service_name=service_name)
+        logfire.configure(token=token, service_name=service_name, console=False)
     except Exception as exc:
         print(f"[{service_name}] logfire configuration failed, continuing without tracing: {exc}", file=sys.stderr)
         return
