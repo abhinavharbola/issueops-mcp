@@ -1,0 +1,50 @@
+import contextlib
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+
+class FakeCursor:
+    def __init__(self, sql, params, conn):
+        self.sql = " ".join(sql.split())
+        self.params = params
+        self.conn = conn
+
+    def fetchone(self):
+        if "SELECT active FROM repo_allowlist" in self.sql:
+            return {"active": self.conn.repo_active}
+        if "INSERT INTO pending_actions" in self.sql and "RETURNING id" in self.sql:
+            return {"id": self.conn.new_id}
+        return None
+
+    def fetchall(self):
+        if "SELECT id, arguments FROM pending_actions" in self.sql:
+            if self.conn.existing_pending:
+                existing_id, existing_arguments = self.conn.existing_pending
+                return [{"id": existing_id, "arguments": existing_arguments}]
+            return []
+        return []
+
+
+class FakeConn:
+    def __init__(self, repo_active=True, existing_pending=None, new_id="new-id-1"):
+        self.repo_active = repo_active
+        self.existing_pending = existing_pending
+        self.new_id = new_id
+        self.queries = []
+
+    def execute(self, sql, params=None):
+        self.queries.append((" ".join(sql.split()), params))
+        return FakeCursor(sql, params, self)
+
+    def transaction(self):
+        return contextlib.nullcontext()
+
+
+def sync_connection_returning(fake_conn):
+    @contextlib.contextmanager
+    def fake_sync_connection(dsn):
+        yield fake_conn
+
+    return fake_sync_connection

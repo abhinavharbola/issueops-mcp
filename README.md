@@ -59,7 +59,7 @@ All issue and comment content pulled from GitHub is wrapped in `<untrusted_issue
 ```
 issueops-mcp/
 ├── agent/
-│   ├── heuristics.py            # advisory prompt-injection phrase match
+│   ├── heuristics.py           # advisory prompt-injection phrase match
 │   ├── prompts.py               # untrusted-content wrapping for the classifier
 │   └── triage.py                # standalone CLI/cron classifier
 │
@@ -67,7 +67,8 @@ issueops-mcp/
 │   ├── actions.py               # approve/reject logic, holds the write PAT
 │   └── app.py                   # Streamlit UI
 │
-├── db/schema.sql                # repo_allowlist, pending_actions, audit_log
+├── db/
+│   └── schema.sql               # repo_allowlist, pending_actions, audit_log
 │
 ├── eval/
 │   ├── eval.py                  # susceptibility, guarantee check, accuracy
@@ -87,10 +88,9 @@ issueops-mcp/
 │   └── allowlist.py             # add/deactivate/list allowlisted repos
 │
 ├── tests/
-│   └── custom_client.py         # MCP client for testing
+│   └── custom_client.py         # minimal stdio MCP client for testing
 │
 ├── .env.example
-├── .gitignore
 ├── requirements.txt
 └── README.md
 ```
