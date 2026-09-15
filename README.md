@@ -60,10 +60,12 @@ actual guarantee is architectural: no execute path exists on the model-facing su
 1. Create a Neon Postgres database, apply `db/schema.sql`.
 2. Copy `.env.example` to `.env`, fill in `NEON_DSN` (use Neon's **pooled** connection string, Streamlit
    reruns the whole script on every interaction and will exhaust a direct connection fast),
-   `GITHUB_READ_PAT`, `GITHUB_WRITE_PAT`, `GROQ_API_KEY`, `LOGFIRE_TOKEN`. Optionally, `GROQ_API_KEY_FALLBACK`
-   if you have a second Groq account — the triage agent and eval script fail over to it automatically on a
-   429 from the first, retrying once more after a short wait if both accounts are rate-limited at the same
-   moment. Leave it unset for a single-account setup.
+   `GITHUB_READ_PAT`, `GITHUB_WRITE_PAT`, `GROQ_API_KEY`. Two are optional: `GROQ_API_KEY_FALLBACK`, if you
+   have a second Groq account — the triage agent and eval script fail over to it automatically on a 429
+   from the first, retrying once more after a short wait if both accounts are rate-limited at the same
+   moment, leave it unset for a single-account setup — and `LOGFIRE_TOKEN`, which turns on tracing for the
+   server, agent, and dashboard (`issueops/observability.py`) if set and is skipped silently if not. Nothing
+   in this project requires Logfire to run.
 3. `pip install -r requirements.txt`
 4. Allowlist a scratch repo you own: `python scripts/allowlist.py add owner/scratch-repo`
 5. Verify the MCP server: `python -m mcp_server.server` (should idle on stdio, Ctrl+C to stop), then
@@ -84,6 +86,11 @@ actual guarantee is architectural: no execute path exists on the model-facing su
      }
    }
    ```
+   `python3` is the macOS/Linux convention. On a stock Windows Python install there is usually no
+   `python3.exe`, only `python.exe`. Run `python -c "import sys; print(sys.executable)"` from your
+   activated environment and use that absolute path as `command` instead of guessing between `python`
+   and `python3`.
+
    If your MCP client doesn't run with your intended `cwd`, or you'd rather not rely on file discovery,
    an explicit `env` block also works — the MCP SDK does not inherit the parent process's full
    environment for stdio-spawned servers (it only passes a small fixed allowlist like `PATH`, `HOME`), so
@@ -108,7 +115,8 @@ the interoperability check. That is the trial-run pass we agreed to do next.
   at GitHub API time on execute, instead of at proposal time like every other `propose_*` tool. Fixed by
   passing `validate_fn=validate`.
 - **`propose_assign` called an endpoint outside the read PAT's declared scope.** See the collaborator
-  note above. Downgraded to a syntactic check; GitHub enforces the real constraint at execute time.
+  note below, under "Choices I made where the PRD was silent." Downgraded to a syntactic check; GitHub
+  enforces the real constraint at execute time.
 - **The triage agent had no per-issue error isolation.** A single malformed-but-valid-JSON classification
   (right shape violated, e.g. `labels_to_add` as a string instead of a list) would raise inside
   `_plan_from_classification` and abort the entire batch. `classify_issue` now validates the classification's

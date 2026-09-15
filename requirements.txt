@@ -4,4 +4,4 @@ python-dotenv>=1.0
 mcp>=2.0
 streamlit>=1.38
 groq>=0.11
-logfire>=0.51
+logfire[requests,psycopg]>=0.51
