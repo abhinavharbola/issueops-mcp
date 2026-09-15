@@ -1,5 +1,7 @@
 from functools import wraps
 
+import requests
+
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
@@ -22,6 +24,8 @@ def _translate_errors(fn):
             return fn(*args, **kwargs)
         except (RepoNotAllowedError, ValidationError, GitHubAPIError) as exc:
             raise ToolError(str(exc)) from exc
+        except requests.exceptions.RequestException as exc:
+            raise ToolError(f"GitHub API request failed: {exc}") from exc
 
     return wrapper
 

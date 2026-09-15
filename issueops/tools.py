@@ -1,4 +1,5 @@
 import json
+import re
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -10,7 +11,6 @@ from issueops.github_client import GitHubReadClient
 VALID_CLOSE_REASONS = {"completed", "not_planned", None}
 
 _label_cache: dict[str, tuple[float, list[str]]] = {}
-_collaborator_cache: dict[str, tuple[float, list[str]]] = {}
 _CACHE_TTL_SECONDS = 300
 
 
@@ -176,10 +176,6 @@ def _get_repo_label_names(read_client: GitHubReadClient, repo: str) -> list[str]
     return _cached(_label_cache, repo, lambda: [l["name"] for l in read_client.get_repo_labels(repo)])
 
 
-def _get_repo_collaborator_logins(read_client: GitHubReadClient, repo: str) -> list[str]:
-    return _cached(_collaborator_cache, repo, lambda: [c["login"] for c in read_client.get_repo_collaborators(repo)])
-
-
 def _normalize_arguments(arguments: dict) -> str:
     return json.dumps(arguments, sort_keys=True)
 
@@ -325,9 +321,10 @@ def propose_remove_labels(dsn, read_client, repo, issue_number, labels, initiato
 
 def propose_assign(dsn, read_client, repo, issue_number, assignee, initiator, heuristic_flagged=False):
     def validate():
-        valid_collaborators = set(_get_repo_collaborator_logins(read_client, repo))
-        if assignee not in valid_collaborators:
-            raise ValidationError(f"{assignee} is not a collaborator on {repo}")
+        if not assignee or not assignee.strip():
+            raise ValidationError("assignee cannot be empty")
+        if not re.match(r"^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$", assignee):
+            raise ValidationError(f"{assignee} is not a syntactically valid GitHub login")
 
     arguments = {"assignee": assignee}
     action_id, preview, created = _queue_proposal(
@@ -344,6 +341,7 @@ def propose_close(dsn, read_client, repo, issue_number, reason, initiator, heuri
 
     arguments = {"reason": reason}
     action_id, preview, created = _queue_proposal(
-        dsn, read_client, "propose_close", repo, issue_number, arguments, initiator, heuristic_flagged
+        dsn, read_client, "propose_close", repo, issue_number, arguments, initiator, heuristic_flagged,
+        validate_fn=validate,
     )
     return {"id": action_id, "preview": f"Close {repo}#{issue_number}: {preview}"}
