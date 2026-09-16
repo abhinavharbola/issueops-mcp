@@ -50,11 +50,13 @@ Three tables in Postgres (Neon), defined in [`db/schema.sql`](db/schema.sql):
 - `pending_actions`: one row per proposed mutation, its arguments, the issue-state snapshot at proposal time, and its status (`pending`, `stale`, `expired`, `blocked`, `executed`, `failed`, `rejected`).
 - `audit_log`: one row per tool call and per proposal-lifecycle event, joined back to `pending_actions` where applicable. This is the ground truth for what happened, not what was attempted.
 
+`db/schema.sql` also defines indexes on `pending_actions`' dedup lookup, `pending_actions`' pending/created-at ordering, and `audit_log`'s timestamp ordering, matching the actual query patterns in `issueops/tools.py`, `issueops/actions.py`, and `dashboard/app.py`.
+
 ## Safety
 
 All issue and comment content pulled from GitHub is wrapped in `<untrusted_issue_content>` delimiters (`agent/prompts.py`) before it reaches the triage agent's prompt, with system instructions telling the model to treat it strictly as data, never as instructions to follow, even if it claims to be from a system, developer, administrator, or the assistant itself. This is a prompt-injection mitigation: issue content comes from the open web and is not trusted input.
 
-This wrapping applies to the standalone triage agent's prompt only. On the MCP server surface (`mcp_server/server.py`), the tool descriptions for `get_issue`, `list_issues`, and `search_issues` instead carry an explicit warning that the returned text is untrusted and must not be treated as instructions, since MCP tool results are returned as raw structured data rather than assembled into a single prompt string. Either way, the actual safety guarantee does not depend on this labeling: nothing on the MCP surface can execute a mutation, so a successful injection can at most produce a bad `propose_*` call, which still lands in `pending_actions` for a human to reject.
+This wrapping applies to the standalone triage agent's prompt only. On the MCP server surface (`mcp_server/server.py`), the tool descriptions for all five read tools (`get_issue`, `list_issues`, `list_pull_requests`, `search_issues`, `get_repo_activity_summary`) instead carry an explicit warning that the returned text is untrusted and must not be treated as instructions, since MCP tool results are returned as raw structured data rather than assembled into a single prompt string. Either way, the actual safety guarantee does not depend on this labeling: nothing on the MCP surface can execute a mutation, so a successful injection can at most produce a bad `propose_*` call, which still lands in `pending_actions` for a human to reject.
 
 ## Project structure
 
@@ -173,6 +175,16 @@ On a stock Windows Python install there is usually no `python3.exe`, only `pytho
 
 ## Changelog
 
+Second-pass audit fixes:
+
+- `build_untrusted_block` in `agent/prompts.py` now strips any occurrence of the `<untrusted_issue_content>`/`</untrusted_issue_content>` markers (case-insensitive, whitespace-tolerant) from title, body, and comment text before interpolating them, so an issue body can no longer forge a closing tag and escape the untrusted block.
+- The dashboard now renders the source issue's title and body with `st.text` instead of `st.markdown`/`st.write`, so attacker-controlled Markdown (links, bold/italic UI mimicry) can no longer render for the human approver.
+- `list_pull_requests` and `get_repo_activity_summary` tool descriptions in `mcp_server/server.py` now carry the same untrusted-content warning as the other read tools.
+- Added indexes on `pending_actions (repo, issue_number, tool_name, status)`, `pending_actions (status, created_at DESC)`, and `audit_log (timestamp DESC)` to `db/schema.sql`, matching the tables' actual hot query paths.
+- Removed the unused `created` return value from every `propose_*` function in `issueops/tools.py`.
+- `propose_assign`'s login regex now rejects consecutive hyphens and enforces GitHub's 39-character login length limit.
+- Actually completed the file moves this changelog already claimed below: `dashboard/actions.py`, `tests/custom_client.py`, and `tests/test_dashboard_actions.py` were still present as stale duplicates of `issueops/actions.py`, `scripts/custom_client.py`, and `tests/test_actions.py`. They're deleted now; the structure described in "Post-audit structure cleanup" is the actual state of the repo.
+
 Post-audit fixes:
 
 - `remove_label` now URL-encodes the label name (labels with spaces or slashes previously broke the request).
@@ -191,3 +203,6 @@ Post-audit structure cleanup:
 - Renamed `tests/test_dashboard_actions.py` to `tests/test_actions.py` to match the moved module, consistent with how every other test file in this repo is named after the module it tests, not the package.
 - `tests/test_actions.py` now uses the shared `FakeConn`/`FakeCursor` from `conftest.py` (extended with a `pending_action_row` parameter) instead of a second, parallel fake DB connection class that duplicated the one already in `conftest.py`.
 - Fixed a `sys.path` bug in `conftest.py`: it inserted `Path(__file__).resolve().parent.parent`, one directory above the project root, copy-pasted from `scripts/allowlist.py` where that offset is correct (that script lives one level deeper). It now inserts `.parent`, the project root itself, matching where `conftest.py` actually sits.
+
+
+

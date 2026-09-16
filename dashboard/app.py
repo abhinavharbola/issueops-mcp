@@ -62,8 +62,8 @@ else:
             try:
                 issue = _fetch_issue_preview(config.neon_dsn, row["repo"], row["issue_number"])
                 st.write("Source issue")
-                st.markdown(f"**{issue['title']}**")
-                st.write(issue["body"] or "(no body)")
+                st.text(issue["title"])
+                st.text(issue["body"] or "(no body)")
             except Exception as exc:
                 st.warning(f"could not fetch source issue: {exc}")
 
@@ -92,3 +92,6 @@ st.subheader("Recent audit log")
 with sync_connection(config.neon_dsn) as conn:
     audit_rows = actions.list_recent_audit_log(conn)
 st.dataframe(audit_rows, use_container_width=True)
+
+
+

@@ -1,5 +1,10 @@
+import re
+
 UNTRUSTED_START = "<untrusted_issue_content>"
 UNTRUSTED_END = "</untrusted_issue_content>"
+
+_MARKER_PATTERN = re.compile(r"<\s*/?\s*untrusted_issue_content\s*>", re.IGNORECASE)
+_MARKER_REPLACEMENT = "[untrusted-content-marker-stripped]"
 
 SYSTEM_PROMPT = """You are a triage classifier for GitHub issues. You read one issue and decide which \
 triage actions, if any, to propose. You never execute actions, you only classify.
@@ -21,15 +26,22 @@ Use an empty list and null values for anything you are not proposing. Only propo
 already exist on the repo (bug, enhancement, question, duplicate, wontfix, documentation are common)."""
 
 
+def _sanitize_for_untrusted_block(text: str) -> str:
+    return _MARKER_PATTERN.sub(_MARKER_REPLACEMENT, text or "")
+
+
 def build_untrusted_block(issue: dict) -> str:
+    title = _sanitize_for_untrusted_block(issue.get("title", ""))
+    body = _sanitize_for_untrusted_block(issue.get("body") or "")
     comments_text = "\n".join(
-        f"comment by {c.get('user', {}).get('login', 'unknown')}: {c.get('body', '')}"
+        f"comment by {c.get('user', {}).get('login', 'unknown')}: "
+        f"{_sanitize_for_untrusted_block(c.get('body', ''))}"
         for c in issue.get("comments_detail", [])
     )
     return (
         f"{UNTRUSTED_START}\n"
-        f"title: {issue.get('title', '')}\n"
-        f"body: {issue.get('body') or ''}\n"
+        f"title: {title}\n"
+        f"body: {body}\n"
         f"comments:\n{comments_text}\n"
         f"{UNTRUSTED_END}"
     )
@@ -37,3 +49,6 @@ def build_untrusted_block(issue: dict) -> str:
 
 def build_user_prompt(issue: dict) -> str:
     return f"Classify this issue.\n\n{build_untrusted_block(issue)}"
+
+
+
