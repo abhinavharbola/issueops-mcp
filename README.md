@@ -38,7 +38,7 @@ The triage agent, run interactively or from a scheduled job, calls `issueops.too
 - **No execute path on the model-facing surface.** Every `propose_*` tool queues a row. None of them can mutate GitHub.
 - **Stale check on approval.** Before executing an approved action, the dashboard re-fetches the issue's current state and compares it to the snapshot taken at proposal time. A mismatch marks the action `stale` instead of executing against a possibly outdated issue.
 - **Dedup.** Identical pending proposals (same repo, issue, tool, and normalized arguments) are matched and reused instead of inserted twice.
-- **48-hour TTL.** Pending actions older than 48 hours auto-expire rather than executing later against a stale issue.
+- **48-hour TTL.** Pending actions older than the TTL auto-expire rather than executing later against a stale issue. Configurable via `PENDING_ACTION_TTL_HOURS` in `.env` (default `48`); read by `dashboard/actions.py` and passed into `expire_stale_pending` and `approve_action`.
 - **Partial-failure tracking.** `propose_remove_labels` runs as sequential per-label DELETE calls. If one fails partway through, `failure_reason` records exactly which labels were removed before the failure, so `audit_log` reflects the real state of the issue on GitHub, not just a generic error.
 - **Heuristic flag is advisory only.** `agent/heuristics.py` flags issue text containing common prompt-injection phrases and surfaces it in the dashboard as a signal. It is never checked in the approval or execution path and is not a security boundary.
 
@@ -53,6 +53,8 @@ Three tables in Postgres (Neon), defined in [`db/schema.sql`](db/schema.sql):
 ## Safety
 
 All issue and comment content pulled from GitHub is wrapped in `<untrusted_issue_content>` delimiters (`agent/prompts.py`) before it reaches the triage agent's prompt, with system instructions telling the model to treat it strictly as data, never as instructions to follow, even if it claims to be from a system, developer, administrator, or the assistant itself. This is a prompt-injection mitigation: issue content comes from the open web and is not trusted input.
+
+This wrapping applies to the standalone triage agent's prompt only. On the MCP server surface (`mcp_server/server.py`), the tool descriptions for `get_issue`, `list_issues`, and `search_issues` instead carry an explicit warning that the returned text is untrusted and must not be treated as instructions, since MCP tool results are returned as raw structured data rather than assembled into a single prompt string. Either way, the actual safety guarantee does not depend on this labeling: nothing on the MCP surface can execute a mutation, so a successful injection can at most produce a bad `propose_*` call, which still lands in `pending_actions` for a human to reject.
 
 ## Project structure
 
@@ -164,3 +166,18 @@ On a stock Windows Python install there is usually no `python3.exe`, only `pytho
 - The Streamlit approver identity is a free-text name field, not authentication. Anyone with dashboard access can type any name. If you need real access control here, that's separate work this project doesn't cover.
 - `propose_assign` validates the assignee syntactically only (a well-formed GitHub login), not against the repo's actual collaborator list. The read PAT's scope doesn't grant access to the collaborators endpoint. GitHub itself rejects an invalid assignee at execute time.
 - The heuristic phrase list in `agent/heuristics.py` is coarse and advisory only. It is not tuned for low false positives and is never part of the approval or execution decision.
+- The repo-label cache in `issueops/tools.py` has a 5-minute TTL. `propose_add_labels` and `propose_remove_labels` retry once against a fresh fetch when a label isn't found in the cached set, so a label created moments earlier isn't wrongly rejected, but the cache can still serve a stale list for up to 5 minutes in other read paths.
+- `search_issues` returns a single page (up to 100 results) since GitHub's Search API paginates differently from the REST list endpoints and has its own rate-limit bucket. `list_issues`, `list_pull_requests`, and `get_issue`'s comment fetch follow `Link` header pagination and return the full result set, capped at 20 pages (2,000 items) as a safety limit.
+
+## Changelog
+
+Post-audit fixes:
+
+- `remove_label` now URL-encodes the label name (labels with spaces or slashes previously broke the request).
+- `PENDING_ACTION_TTL_HOURS` and `COMMENT_BODY_MAX_CHARS` are now read from the environment and actually threaded through `dashboard/actions.py` and `propose_add_comment`; previously they were unused fields on `Config`.
+- Removed the dead `'approved'` value from the `pending_actions` status CHECK constraint in `db/schema.sql`; no code path ever set it.
+- `run_triage` no longer aborts the entire batch if one issue summary is missing a `number` field; it now records a per-issue error and continues.
+- `propose_add_labels` / `propose_remove_labels` retry once against a live label fetch before rejecting an unknown label, reducing false rejections from the 5-minute label cache.
+- `list_issues`, `list_pull_requests`, and `get_issue`'s comment fetch now follow GitHub's `Link` header pagination instead of silently truncating at 100 results.
+- Added test coverage for `dashboard/actions.py` (`approve_action`, `reject_action`, the stale-state check, and partial-failure label removal), previously untested despite being the only code path that mutates GitHub.
+- MCP tool descriptions for `get_issue`, `list_issues`, and `search_issues` now explicitly flag returned issue/comment text as untrusted content.

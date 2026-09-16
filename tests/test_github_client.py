@@ -5,11 +5,12 @@ import pytest
 from issueops.github_client import GitHubAPIError, GitHubReadClient, GitHubWriteClient
 
 
-def _mock_response(status_code, json_data=None, text=""):
+def _mock_response(status_code, json_data=None, text="", headers=None):
     response = MagicMock()
     response.status_code = status_code
     response.text = text
     response.json.return_value = json_data
+    response.headers = headers if headers is not None else {}
     return response
 
 
@@ -52,3 +53,54 @@ def test_add_comment_sends_body_as_json_payload():
 
     _, kwargs = mock_request.call_args
     assert kwargs["json"] == {"body": "looks good"}
+
+
+def test_remove_label_url_encodes_a_label_with_a_space():
+    client = GitHubWriteClient("fake-write-pat")
+    mock_request = MagicMock(return_value=_mock_response(204))
+    client._session.request = mock_request
+
+    client.remove_label("owner/repo", 5, "good first issue")
+
+    args, _ = mock_request.call_args
+    url = args[1]
+    assert "good%20first%20issue" in url
+    assert " " not in url
+
+
+def test_remove_label_url_encodes_a_label_with_a_slash():
+    client = GitHubWriteClient("fake-write-pat")
+    mock_request = MagicMock(return_value=_mock_response(204))
+    client._session.request = mock_request
+
+    client.remove_label("owner/repo", 5, "area/backend")
+
+    args, _ = mock_request.call_args
+    url = args[1]
+    assert url.endswith("/labels/area%2Fbackend")
+
+
+def test_list_issues_follows_link_header_pagination():
+    client = GitHubReadClient("fake-pat")
+    page1 = _mock_response(
+        200,
+        json_data=[{"number": 1}],
+        headers={"Link": '<https://api.github.com/repos/owner/repo/issues?page=2>; rel="next"'},
+    )
+    page2 = _mock_response(200, json_data=[{"number": 2}], headers={})
+    client._session.request = MagicMock(side_effect=[page1, page2])
+
+    issues = client.list_issues("owner/repo")
+
+    assert [i["number"] for i in issues] == [1, 2]
+
+
+def test_list_issues_stops_when_there_is_no_next_link():
+    client = GitHubReadClient("fake-pat")
+    page1 = _mock_response(200, json_data=[{"number": 1}], headers={})
+    client._session.request = MagicMock(return_value=page1)
+
+    issues = client.list_issues("owner/repo")
+
+    assert [i["number"] for i in issues] == [1]
+    assert client._session.request.call_count == 1

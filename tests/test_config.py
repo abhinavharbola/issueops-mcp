@@ -11,6 +11,8 @@ REQUIRED_VARS = [
     "GROQ_API_KEY",
     "GROQ_API_KEY_FALLBACK",
     "LOGFIRE_TOKEN",
+    "PENDING_ACTION_TTL_HOURS",
+    "COMMENT_BODY_MAX_CHARS",
 ]
 
 
@@ -61,3 +63,43 @@ def test_write_pat_required_and_present_is_kept(monkeypatch):
     result = config.load_config(require_write_pat=True)
 
     assert result.github_write_pat == "write-pat"
+
+
+def test_ttl_and_comment_max_default_when_unset(monkeypatch):
+    _clear_env(monkeypatch)
+    _set_minimum_required_env(monkeypatch)
+
+    result = config.load_config(require_write_pat=False)
+
+    assert result.pending_action_ttl_hours == 48
+    assert result.comment_body_max_chars == 65536
+
+
+def test_ttl_and_comment_max_are_read_from_the_environment(monkeypatch):
+    _clear_env(monkeypatch)
+    _set_minimum_required_env(monkeypatch)
+    monkeypatch.setenv("PENDING_ACTION_TTL_HOURS", "12")
+    monkeypatch.setenv("COMMENT_BODY_MAX_CHARS", "1000")
+
+    result = config.load_config(require_write_pat=False)
+
+    assert result.pending_action_ttl_hours == 12
+    assert result.comment_body_max_chars == 1000
+
+
+def test_non_integer_ttl_raises(monkeypatch):
+    _clear_env(monkeypatch)
+    _set_minimum_required_env(monkeypatch)
+    monkeypatch.setenv("PENDING_ACTION_TTL_HOURS", "not-a-number")
+
+    with pytest.raises(RuntimeError):
+        config.load_config(require_write_pat=False)
+
+
+def test_zero_or_negative_comment_max_raises(monkeypatch):
+    _clear_env(monkeypatch)
+    _set_minimum_required_env(monkeypatch)
+    monkeypatch.setenv("COMMENT_BODY_MAX_CHARS", "0")
+
+    with pytest.raises(RuntimeError):
+        config.load_config(require_write_pat=False)
