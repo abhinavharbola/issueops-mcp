@@ -15,7 +15,7 @@ A guarded MCP server for GitHub issue triage. Ten tools on the model-facing surf
 ```mermaid
 flowchart TD
     claude[Claude Desktop] -->|stdio| server[mcp_server/server.py]
-    custom[tests/custom_client.py] -->|stdio| server
+    custom[scripts/custom_client.py] -->|stdio| server
     server --> toolsmod[issueops/tools.py]
 
     cron[agent/triage.py] --> toolsmod
@@ -23,12 +23,12 @@ flowchart TD
     toolsmod -->|read PAT| githubread[GitHub REST, read only]
     toolsmod --> neon[(Neon: pending_actions, audit_log)]
 
-    dashboard[dashboard/app.py] --> dbactions[dashboard/actions.py]
-    dbactions -->|write PAT| githubwrite[GitHub REST, mutating]
-    dbactions --> neon
+    dashboard[dashboard/app.py] --> actionsmod[issueops/actions.py]
+    actionsmod -->|write PAT| githubwrite[GitHub REST, mutating]
+    actionsmod --> neon
 ```
 
-`issueops/tools.py` is the only module both the MCP server and the triage agent import. It has zero MCP or Streamlit imports. `GitHubWriteClient` is only ever constructed inside `dashboard/actions.py`, so the write PAT never enters the MCP server's or triage agent's process.
+`issueops/tools.py` is the only module both the MCP server and the triage agent import. It has zero MCP or Streamlit imports. `GitHubWriteClient` is only ever constructed inside `issueops/actions.py`, called from `dashboard/app.py`, so the write PAT never enters the MCP server's or triage agent's process.
 
 The triage agent, run interactively or from a scheduled job, calls `issueops.tools` directly. It never opens an MCP client session.
 
@@ -38,7 +38,7 @@ The triage agent, run interactively or from a scheduled job, calls `issueops.too
 - **No execute path on the model-facing surface.** Every `propose_*` tool queues a row. None of them can mutate GitHub.
 - **Stale check on approval.** Before executing an approved action, the dashboard re-fetches the issue's current state and compares it to the snapshot taken at proposal time. A mismatch marks the action `stale` instead of executing against a possibly outdated issue.
 - **Dedup.** Identical pending proposals (same repo, issue, tool, and normalized arguments) are matched and reused instead of inserted twice.
-- **48-hour TTL.** Pending actions older than the TTL auto-expire rather than executing later against a stale issue. Configurable via `PENDING_ACTION_TTL_HOURS` in `.env` (default `48`); read by `dashboard/actions.py` and passed into `expire_stale_pending` and `approve_action`.
+- **48-hour TTL.** Pending actions older than the TTL auto-expire rather than executing later against a stale issue. Configurable via `PENDING_ACTION_TTL_HOURS` in `.env` (default `48`); read by `issueops/actions.py` and passed into `expire_stale_pending` and `approve_action`.
 - **Partial-failure tracking.** `propose_remove_labels` runs as sequential per-label DELETE calls. If one fails partway through, `failure_reason` records exactly which labels were removed before the failure, so `audit_log` reflects the real state of the issue on GitHub, not just a generic error.
 - **Heuristic flag is advisory only.** `agent/heuristics.py` flags issue text containing common prompt-injection phrases and surfaces it in the dashboard as a signal. It is never checked in the approval or execution path and is not a security boundary.
 
@@ -66,8 +66,7 @@ issueops-mcp/
 │   └── triage.py                # standalone CLI/cron classifier
 │
 ├── dashboard/
-│   ├── actions.py               # approve/reject logic, holds the write PAT
-│   └── app.py                   # Streamlit UI
+│   └── app.py                   # Streamlit UI only
 │
 ├── db/
 │   └── schema.sql               # repo_allowlist, pending_actions, audit_log
@@ -77,6 +76,7 @@ issueops-mcp/
 │   └── labels_template.json     # copy to labels.json, then hand-label
 │
 ├── issueops/
+│   ├── actions.py               # approve/reject/execute logic, holds the write PAT
 │   ├── config.py                # env loading, drops write PAT when unused
 │   ├── db.py                    # Neon/Postgres connection helper
 │   ├── github_client.py         # GitHubReadClient, GitHubWriteClient
@@ -87,11 +87,13 @@ issueops-mcp/
 │   └── server.py                # stdio MCP server, ten tools
 │
 ├── scripts/
-│   └── allowlist.py             # add/deactivate/list allowlisted repos
+│   ├── allowlist.py             # add/deactivate/list allowlisted repos
+│   └── custom_client.py         # minimal stdio MCP client for manual testing
 │
 ├── tests/
-│   └── custom_client.py         # minimal stdio MCP client for testing
+│   └── test_*.py                # pytest suite, one file per module under test
 │
+├── conftest.py                  # shared pytest fixtures (FakeConn, FakeCursor)
 ├── .env.example
 ├── requirements.txt
 └── README.md
@@ -125,7 +127,7 @@ issueops-mcp/
 
 ```
 python -m mcp_server.server
-python tests/custom_client.py list_issues '{"repo": "owner/scratch-repo"}'
+python scripts/custom_client.py list_issues '{"repo": "owner/scratch-repo"}'
 streamlit run dashboard/app.py
 python -m agent.triage owner/scratch-repo --max-issues 3
 ```
@@ -174,10 +176,18 @@ On a stock Windows Python install there is usually no `python3.exe`, only `pytho
 Post-audit fixes:
 
 - `remove_label` now URL-encodes the label name (labels with spaces or slashes previously broke the request).
-- `PENDING_ACTION_TTL_HOURS` and `COMMENT_BODY_MAX_CHARS` are now read from the environment and actually threaded through `dashboard/actions.py` and `propose_add_comment`; previously they were unused fields on `Config`.
+- `PENDING_ACTION_TTL_HOURS` and `COMMENT_BODY_MAX_CHARS` are now read from the environment and actually threaded through `issueops/actions.py` and `propose_add_comment`; previously they were unused fields on `Config`.
 - Removed the dead `'approved'` value from the `pending_actions` status CHECK constraint in `db/schema.sql`; no code path ever set it.
 - `run_triage` no longer aborts the entire batch if one issue summary is missing a `number` field; it now records a per-issue error and continues.
 - `propose_add_labels` / `propose_remove_labels` retry once against a live label fetch before rejecting an unknown label, reducing false rejections from the 5-minute label cache.
 - `list_issues`, `list_pull_requests`, and `get_issue`'s comment fetch now follow GitHub's `Link` header pagination instead of silently truncating at 100 results.
-- Added test coverage for `dashboard/actions.py` (`approve_action`, `reject_action`, the stale-state check, and partial-failure label removal), previously untested despite being the only code path that mutates GitHub.
+- Added test coverage for `issueops/actions.py` (`approve_action`, `reject_action`, the stale-state check, and partial-failure label removal), previously untested despite being the only code path that mutates GitHub.
 - MCP tool descriptions for `get_issue`, `list_issues`, and `search_issues` now explicitly flag returned issue/comment text as untrusted content.
+
+Post-audit structure cleanup:
+
+- Moved `dashboard/actions.py` to `issueops/actions.py`. It's domain logic (approve, reject, execute against GitHub, audit logging), not UI code; it doesn't belong split from `issueops/tools.py`, which handles the other half of the same propose/approve workflow. `dashboard/app.py` now imports it as `from issueops import actions`. `dashboard/` now holds only `app.py`, the actual Streamlit UI.
+- Moved `tests/custom_client.py` to `scripts/custom_client.py`. It's a manual CLI driver for poking the MCP server over stdio, not a pytest test; it was never collected by `pytest tests/` in the first place since it has no `test_` prefix.
+- Renamed `tests/test_dashboard_actions.py` to `tests/test_actions.py` to match the moved module, consistent with how every other test file in this repo is named after the module it tests, not the package.
+- `tests/test_actions.py` now uses the shared `FakeConn`/`FakeCursor` from `conftest.py` (extended with a `pending_action_row` parameter) instead of a second, parallel fake DB connection class that duplicated the one already in `conftest.py`.
+- Fixed a `sys.path` bug in `conftest.py`: it inserted `Path(__file__).resolve().parent.parent`, one directory above the project root, copy-pasted from `scripts/allowlist.py` where that offset is correct (that script lives one level deeper). It now inserts `.parent`, the project root itself, matching where `conftest.py` actually sits.
