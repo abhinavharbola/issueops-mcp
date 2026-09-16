@@ -25,6 +25,18 @@ def load_config(require_write_pat: bool = False) -> Config:
             raise RuntimeError(f"missing required environment variable: {name}")
         return value
 
+    def optional_int(name: str, default: int) -> int:
+        raw = os.environ.get(name)
+        if not raw:
+            return default
+        try:
+            value = int(raw)
+        except ValueError:
+            raise RuntimeError(f"{name} must be an integer, got: {raw!r}")
+        if value <= 0:
+            raise RuntimeError(f"{name} must be a positive integer, got: {value}")
+        return value
+
     write_pat = os.environ.get("GITHUB_WRITE_PAT")
     if require_write_pat and not write_pat:
         raise RuntimeError("missing required environment variable: GITHUB_WRITE_PAT")
@@ -48,4 +60,6 @@ def load_config(require_write_pat: bool = False) -> Config:
         # in this project should fail to start because observability isn't
         # configured yet. See issueops/observability.py.
         logfire_token=os.environ.get("LOGFIRE_TOKEN") or None,
+        pending_action_ttl_hours=optional_int("PENDING_ACTION_TTL_HOURS", 48),
+        comment_body_max_chars=optional_int("COMMENT_BODY_MAX_CHARS", 65536),
     )

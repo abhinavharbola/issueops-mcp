@@ -40,7 +40,7 @@ if "last_action_result" in st.session_state:
         st.error(f"Not executed: {result}")
 
 with sync_connection(config.neon_dsn) as conn:
-    actions.expire_stale_pending(conn)
+    actions.expire_stale_pending(conn, ttl_hours=config.pending_action_ttl_hours)
     pending = actions.list_pending_actions(conn)
 
 if not pending:
@@ -72,7 +72,10 @@ else:
             with col1:
                 if st.button("Approve", key=f"approve_{row['id']}", disabled=not approver):
                     with sync_connection(config.neon_dsn) as conn:
-                        result = actions.approve_action(conn, read_client, write_client, row["id"], approver)
+                        result = actions.approve_action(
+                            conn, read_client, write_client, row["id"], approver,
+                            ttl_hours=config.pending_action_ttl_hours,
+                        )
                     st.session_state["last_action_result"] = result
                     st.rerun()
             with col2:

@@ -187,8 +187,10 @@ def run_triage(repo: str, initiator: str, state: str = "open", max_issues: int |
         if "pull_request" in summary:
             continue
 
-        issue_number = summary["number"]
+        issue_number = summary.get("number")
         try:
+            if issue_number is None:
+                raise ValueError("issue summary is missing a 'number' field")
             issue = tools.get_issue(dsn, read_client, repo, issue_number, initiator)
             flagged = is_heuristically_flagged(_issue_plaintext(issue))
             classification = classify_issue(groq_clients, model, issue)

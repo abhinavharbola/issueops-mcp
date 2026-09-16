@@ -3,18 +3,21 @@ from datetime import datetime, timedelta, timezone
 from issueops import tools
 from issueops.github_client import GitHubReadClient, GitHubWriteClient
 
-
-def _now_minus_48h():
-    return datetime.now(timezone.utc) - timedelta(hours=48)
+DEFAULT_PENDING_ACTION_TTL_HOURS = 48
 
 
-def expire_stale_pending(conn):
+def _now_minus_ttl(ttl_hours: int = DEFAULT_PENDING_ACTION_TTL_HOURS):
+    return datetime.now(timezone.utc) - timedelta(hours=ttl_hours)
+
+
+def expire_stale_pending(conn, ttl_hours: int = DEFAULT_PENDING_ACTION_TTL_HOURS):
     conn.execute(
         """
         UPDATE pending_actions
         SET status = 'expired'
-        WHERE status = 'pending' AND created_at < now() - interval '48 hours'
-        """
+        WHERE status = 'pending' AND created_at < now() - (%s * interval '1 hour')
+        """,
+        (ttl_hours,),
     )
 
 
@@ -56,7 +59,10 @@ def _execute_on_github(write_client: GitHubWriteClient, tool_name: str, repo: st
     raise ValueError(f"unknown mutating tool: {tool_name}")
 
 
-def approve_action(conn, read_client: GitHubReadClient, write_client: GitHubWriteClient, action_id: str, approver: str):
+def approve_action(
+    conn, read_client: GitHubReadClient, write_client: GitHubWriteClient, action_id: str, approver: str,
+    ttl_hours: int = DEFAULT_PENDING_ACTION_TTL_HOURS,
+):
     with conn.transaction():
         row = conn.execute(
             "SELECT * FROM pending_actions WHERE id = %s AND status = 'pending' FOR UPDATE", (action_id,)
@@ -66,7 +72,7 @@ def approve_action(conn, read_client: GitHubReadClient, write_client: GitHubWrit
 
         tool_name, repo, issue_number, arguments = row["tool_name"], row["repo"], row["issue_number"], row["arguments"]
 
-        if row["created_at"] < _now_minus_48h():
+        if row["created_at"] < _now_minus_ttl(ttl_hours):
             conn.execute("UPDATE pending_actions SET status = 'expired' WHERE id = %s", (action_id,))
             tools.write_audit_log(conn, tool_name, repo, issue_number, arguments, action_id, approver, "expired", "expired between page load and approve click", 0)
             return {"status": "expired"}

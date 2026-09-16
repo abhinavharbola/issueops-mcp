@@ -1,3 +1,5 @@
+from urllib.parse import quote
+
 import requests
 
 GITHUB_API_BASE = "https://api.github.com"
@@ -29,31 +31,73 @@ class _BaseClient:
             return None
         return response.json()
 
+    def _request_raw(self, method: str, path: str, **kwargs):
+        response = self._session.request(method, f"{GITHUB_API_BASE}{path}", timeout=15, **kwargs)
+        if response.status_code >= 400:
+            raise GitHubAPIError(response.status_code, response.text)
+        return response
+
+    def _paginated_get(self, path: str, params: dict, max_pages: int = 20):
+        results = []
+        page_params = dict(params)
+        page_params.setdefault("per_page", 100)
+        next_path = path
+        next_params = page_params
+        pages_fetched = 0
+
+        while next_path is not None and pages_fetched < max_pages:
+            response = self._request_raw("GET", next_path, params=next_params)
+            data = response.json()
+            if isinstance(data, dict) and "items" in data:
+                results.extend(data["items"])
+            else:
+                results.extend(data)
+            pages_fetched += 1
+
+            next_path = None
+            next_params = None
+            link_header = response.headers.get("Link")
+            if link_header:
+                for part in link_header.split(","):
+                    segment = part.strip()
+                    if 'rel="next"' not in segment:
+                        continue
+                    start = segment.find("<")
+                    end = segment.find(">")
+                    if start == -1 or end == -1:
+                        continue
+                    next_url = segment[start + 1:end]
+                    next_path = next_url[len(GITHUB_API_BASE):]
+                    next_params = None
+                    break
+
+        return results
+
 
 class GitHubReadClient(_BaseClient):
     def list_issues(self, repo: str, state: str = "open", labels: list[str] | None = None, since: str | None = None):
-        params = {"state": state, "per_page": 100}
+        params = {"state": state}
         if labels:
             params["labels"] = ",".join(labels)
         if since:
             params["since"] = since
-        return self._request("GET", f"/repos/{repo}/issues", params=params)
+        return self._paginated_get(f"/repos/{repo}/issues", params)
 
     def get_issue(self, repo: str, issue_number: int):
         issue = self._request("GET", f"/repos/{repo}/issues/{issue_number}")
-        comments = self._request("GET", f"/repos/{repo}/issues/{issue_number}/comments", params={"per_page": 100})
+        comments = self._paginated_get(f"/repos/{repo}/issues/{issue_number}/comments", {})
         issue["comments_detail"] = comments
         return issue
 
     def list_pull_requests(self, repo: str, state: str = "open"):
-        return self._request("GET", f"/repos/{repo}/pulls", params={"state": state, "per_page": 100})
+        return self._paginated_get(f"/repos/{repo}/pulls", {"state": state})
 
     def search_issues(self, repo: str, query: str):
         full_query = f"repo:{repo} {query}"
         return self._request("GET", "/search/issues", params={"q": full_query, "per_page": 100})
 
     def get_repo_labels(self, repo: str):
-        return self._request("GET", f"/repos/{repo}/labels", params={"per_page": 100})
+        return self._paginated_get(f"/repos/{repo}/labels", {})
 
 
 class GitHubWriteClient(_BaseClient):
@@ -64,7 +108,8 @@ class GitHubWriteClient(_BaseClient):
         return self._request("POST", f"/repos/{repo}/issues/{issue_number}/labels", json={"labels": labels})
 
     def remove_label(self, repo: str, issue_number: int, label: str):
-        return self._request("DELETE", f"/repos/{repo}/issues/{issue_number}/labels/{label}")
+        encoded_label = quote(label, safe="")
+        return self._request("DELETE", f"/repos/{repo}/issues/{issue_number}/labels/{encoded_label}")
 
     def assign(self, repo: str, issue_number: int, assignee: str):
         return self._request("POST", f"/repos/{repo}/issues/{issue_number}/assignees", json={"assignees": [assignee]})

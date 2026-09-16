@@ -10,6 +10,8 @@ from issueops.github_client import GitHubReadClient
 
 VALID_CLOSE_REASONS = {"completed", "not_planned", None}
 
+DEFAULT_COMMENT_BODY_MAX_CHARS = 65536
+
 _label_cache: dict[str, tuple[float, list[str]]] = {}
 _CACHE_TTL_SECONDS = 300
 
@@ -162,18 +164,21 @@ def get_repo_activity_summary(dsn, read_client: GitHubReadClient, repo, days, in
     return _run_read_tool(dsn, "get_repo_activity_summary", repo, None, arguments, initiator, compute)
 
 
-def _cached(cache: dict, key: str, fetch_fn):
+def _cached(cache: dict, key: str, fetch_fn, force_refresh: bool = False):
     now = _now_ts()
     cached = cache.get(key)
-    if cached and now - cached[0] < _CACHE_TTL_SECONDS:
+    if not force_refresh and cached and now - cached[0] < _CACHE_TTL_SECONDS:
         return cached[1]
     value = fetch_fn()
     cache[key] = (now, value)
     return value
 
 
-def _get_repo_label_names(read_client: GitHubReadClient, repo: str) -> list[str]:
-    return _cached(_label_cache, repo, lambda: [l["name"] for l in read_client.get_repo_labels(repo)])
+def _get_repo_label_names(read_client: GitHubReadClient, repo: str, force_refresh: bool = False) -> list[str]:
+    return _cached(
+        _label_cache, repo, lambda: [l["name"] for l in read_client.get_repo_labels(repo)],
+        force_refresh=force_refresh,
+    )
 
 
 def _normalize_arguments(arguments: dict) -> str:
@@ -268,14 +273,17 @@ def _queue_proposal(
             raise
 
 
-def propose_add_comment(dsn, read_client, repo, issue_number, body, initiator, heuristic_flagged=False):
+def propose_add_comment(
+    dsn, read_client, repo, issue_number, body, initiator, heuristic_flagged=False,
+    max_body_chars: int = DEFAULT_COMMENT_BODY_MAX_CHARS,
+):
     body = body.strip()
 
     def validate():
         if not body:
             raise ValidationError("comment body cannot be empty")
-        if len(body) > 65536:
-            raise ValidationError("comment body exceeds max length")
+        if len(body) > max_body_chars:
+            raise ValidationError(f"comment body exceeds max length of {max_body_chars} characters")
 
     arguments = {"body": body}
     action_id, preview, created = _queue_proposal(
@@ -292,7 +300,10 @@ def propose_add_labels(dsn, read_client, repo, issue_number, labels, initiator, 
         valid_labels = set(_get_repo_label_names(read_client, repo))
         unknown = [l for l in labels if l not in valid_labels]
         if unknown:
-            raise ValidationError(f"unknown labels for {repo}: {unknown}")
+            valid_labels = set(_get_repo_label_names(read_client, repo, force_refresh=True))
+            unknown = [l for l in labels if l not in valid_labels]
+            if unknown:
+                raise ValidationError(f"unknown labels for {repo}: {unknown}")
 
     arguments = {"labels": sorted(labels)}
     action_id, preview, created = _queue_proposal(
@@ -309,7 +320,10 @@ def propose_remove_labels(dsn, read_client, repo, issue_number, labels, initiato
         valid_labels = set(_get_repo_label_names(read_client, repo))
         unknown = [l for l in labels if l not in valid_labels]
         if unknown:
-            raise ValidationError(f"unknown labels for {repo}: {unknown}")
+            valid_labels = set(_get_repo_label_names(read_client, repo, force_refresh=True))
+            unknown = [l for l in labels if l not in valid_labels]
+            if unknown:
+                raise ValidationError(f"unknown labels for {repo}: {unknown}")
 
     arguments = {"labels": sorted(labels)}
     action_id, preview, created = _queue_proposal(

@@ -15,7 +15,7 @@ CREATE TABLE pending_actions (
     heuristic_flagged BOOLEAN DEFAULT false,
     requested_by TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending'
-        CHECK (status IN ('pending', 'approved', 'rejected', 'expired', 'stale', 'blocked', 'executed', 'failed')),
+        CHECK (status IN ('pending', 'rejected', 'expired', 'stale', 'blocked', 'executed', 'failed')),
     approved_by TEXT,
     approved_at TIMESTAMPTZ,
     executed_at TIMESTAMPTZ,
