@@ -5,8 +5,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import streamlit as st
 
-import actions
-from issueops import tools
+from issueops import actions, tools
 from issueops.config import load_config
 from issueops.db import sync_connection
 from issueops.github_client import GitHubReadClient, GitHubWriteClient
