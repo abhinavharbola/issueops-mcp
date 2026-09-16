@@ -2,7 +2,7 @@ import contextlib
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
 class FakeCursor:
@@ -12,6 +12,8 @@ class FakeCursor:
         self.conn = conn
 
     def fetchone(self):
+        if "SELECT * FROM pending_actions WHERE id" in self.sql:
+            return self.conn.pending_action_row
         if "SELECT active FROM repo_allowlist" in self.sql:
             return {"active": self.conn.repo_active}
         if "INSERT INTO pending_actions" in self.sql and "RETURNING id" in self.sql:
@@ -28,10 +30,11 @@ class FakeCursor:
 
 
 class FakeConn:
-    def __init__(self, repo_active=True, existing_pending=None, new_id="new-id-1"):
+    def __init__(self, repo_active=True, existing_pending=None, new_id="new-id-1", pending_action_row=None):
         self.repo_active = repo_active
         self.existing_pending = existing_pending
         self.new_id = new_id
+        self.pending_action_row = pending_action_row
         self.queries = []
 
     def execute(self, sql, params=None):
