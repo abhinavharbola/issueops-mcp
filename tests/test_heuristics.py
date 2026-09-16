@@ -17,3 +17,6 @@ def test_does_not_flag_an_ordinary_bug_report():
 def test_every_listed_phrase_actually_triggers_the_flag():
     for phrase in HEURISTIC_PHRASES:
         assert is_heuristically_flagged(f"some text before {phrase} some text after")
+
+
+

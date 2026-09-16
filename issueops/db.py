@@ -8,3 +8,6 @@ from psycopg.rows import dict_row
 def sync_connection(dsn: str):
     with psycopg.connect(dsn, row_factory=dict_row, autocommit=True) as conn:
         yield conn
+
+
+

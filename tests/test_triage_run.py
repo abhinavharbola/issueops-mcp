@@ -99,3 +99,5 @@ def test_a_validation_error_on_one_proposal_does_not_abort_the_issue(monkeypatch
     assert len(results) == 1
     assert results[0]["proposals"][0]["tool_name"] == "propose_close"
     assert "reason must be one of" in results[0]["proposals"][0]["error"]
+
+

@@ -49,3 +49,6 @@ def test_an_unrelated_exception_is_left_unchanged(server_module):
 
     with pytest.raises(KeyError):
         boom()
+
+
+

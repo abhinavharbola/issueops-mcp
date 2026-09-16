@@ -103,3 +103,6 @@ def test_zero_or_negative_comment_max_raises(monkeypatch):
 
     with pytest.raises(RuntimeError):
         config.load_config(require_write_pat=False)
+
+
+

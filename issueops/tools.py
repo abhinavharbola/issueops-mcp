@@ -286,7 +286,7 @@ def propose_add_comment(
             raise ValidationError(f"comment body exceeds max length of {max_body_chars} characters")
 
     arguments = {"body": body}
-    action_id, preview, created = _queue_proposal(
+    action_id, preview, _ = _queue_proposal(
         dsn, read_client, "propose_add_comment", repo, issue_number, arguments, initiator, heuristic_flagged,
         validate_fn=validate,
     )
@@ -306,7 +306,7 @@ def propose_add_labels(dsn, read_client, repo, issue_number, labels, initiator, 
                 raise ValidationError(f"unknown labels for {repo}: {unknown}")
 
     arguments = {"labels": sorted(labels)}
-    action_id, preview, created = _queue_proposal(
+    action_id, preview, _ = _queue_proposal(
         dsn, read_client, "propose_add_labels", repo, issue_number, arguments, initiator, heuristic_flagged,
         validate_fn=validate,
     )
@@ -326,7 +326,7 @@ def propose_remove_labels(dsn, read_client, repo, issue_number, labels, initiato
                 raise ValidationError(f"unknown labels for {repo}: {unknown}")
 
     arguments = {"labels": sorted(labels)}
-    action_id, preview, created = _queue_proposal(
+    action_id, preview, _ = _queue_proposal(
         dsn, read_client, "propose_remove_labels", repo, issue_number, arguments, initiator, heuristic_flagged,
         validate_fn=validate,
     )
@@ -337,11 +337,11 @@ def propose_assign(dsn, read_client, repo, issue_number, assignee, initiator, he
     def validate():
         if not assignee or not assignee.strip():
             raise ValidationError("assignee cannot be empty")
-        if not re.match(r"^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$", assignee):
+        if len(assignee) > 39 or not re.match(r"^[A-Za-z0-9](?:-?[A-Za-z0-9])*$", assignee):
             raise ValidationError(f"{assignee} is not a syntactically valid GitHub login")
 
     arguments = {"assignee": assignee}
-    action_id, preview, created = _queue_proposal(
+    action_id, preview, _ = _queue_proposal(
         dsn, read_client, "propose_assign", repo, issue_number, arguments, initiator, heuristic_flagged,
         validate_fn=validate,
     )
@@ -354,8 +354,11 @@ def propose_close(dsn, read_client, repo, issue_number, reason, initiator, heuri
             raise ValidationError(f"reason must be one of {sorted(r for r in VALID_CLOSE_REASONS if r)} or omitted")
 
     arguments = {"reason": reason}
-    action_id, preview, created = _queue_proposal(
+    action_id, preview, _ = _queue_proposal(
         dsn, read_client, "propose_close", repo, issue_number, arguments, initiator, heuristic_flagged,
         validate_fn=validate,
     )
     return {"id": action_id, "preview": f"Close {repo}#{issue_number}: {preview}"}
+
+
+
