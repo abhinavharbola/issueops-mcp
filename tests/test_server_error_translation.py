@@ -11,6 +11,7 @@ def server_module(monkeypatch):
     monkeypatch.setenv("GROQ_API_KEY", "fake-groq-key")
     monkeypatch.delenv("GITHUB_WRITE_PAT", raising=False)
     monkeypatch.delenv("LOGFIRE_TOKEN", raising=False)
+    monkeypatch.delenv("MCP_CLIENT_LABEL", raising=False)
 
     import mcp_server.server as module
 
@@ -49,6 +50,3 @@ def test_an_unrelated_exception_is_left_unchanged(server_module):
 
     with pytest.raises(KeyError):
         boom()
-
-
-

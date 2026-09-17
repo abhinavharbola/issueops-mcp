@@ -40,7 +40,9 @@ The triage agent, run interactively or from a scheduled job, calls `issueops.too
 - **Dedup.** Identical pending proposals (same repo, issue, tool, and normalized arguments) are matched and reused instead of inserted twice.
 - **48-hour TTL.** Pending actions older than the TTL auto-expire rather than executing later against a stale issue. Configurable via `PENDING_ACTION_TTL_HOURS` in `.env` (default `48`); read by `issueops/actions.py` and passed into `expire_stale_pending` and `approve_action`.
 - **Partial-failure tracking.** `propose_remove_labels` runs as sequential per-label DELETE calls. If one fails partway through, `failure_reason` records exactly which labels were removed before the failure, so `audit_log` reflects the real state of the issue on GitHub, not just a generic error.
-- **Heuristic flag is advisory only.** `agent/heuristics.py` flags issue text containing common prompt-injection phrases and surfaces it in the dashboard as a signal. It is never checked in the approval or execution path and is not a security boundary.
+- **Heuristic flag is advisory only.** `agent/heuristics.py` flags issue text containing common prompt-injection phrases and surfaces it in the dashboard as a signal. It is never checked in the approval or execution path and is not a security boundary. It's computed on both paths that can queue a proposal: the scheduled triage agent (`agent/triage.py`) and every `propose_*` tool on the MCP server (`mcp_server/server.py`'s `_heuristic_flag_for_issue`, which re-fetches the issue and reuses the same phrase match). Earlier versions only set it from the triage agent, so the dashboard's advisory signal never appeared for the interactive Claude Desktop path, which is the one most exposed to injected issue content.
+- **Dashboard access token.** `DASHBOARD_ACCESS_TOKEN`, if set, gates the whole dashboard behind a shared secret (`secrets.compare_digest`, not a plain `==`) before it shows any pending action or accepts an approve/reject click. If unset, the dashboard still runs, but shows a persistent warning that it has no access control, instead of only documenting that fact in this README.
+- **Row lock spans the GitHub calls in `approve_action`, on purpose.** The `FOR UPDATE` lock taken on a `pending_actions` row during approval is held across the stale-state re-fetch and the GitHub mutation itself. That's what prevents a double-click, or two approvers racing the same row, from executing the same action twice. It's a per-row lock: it doesn't block unrelated pending actions, and it doesn't hold up the rest of the dashboard.
 
 ## Data model
 
@@ -93,7 +95,7 @@ issueops-mcp/
 │   └── custom_client.py         # minimal stdio MCP client for manual testing
 │
 ├── tests/
-│   └── test_*.py                # pytest suite, one file per module under test
+│   └── test_*.py                # pytest suite, generally one file per module under test
 │
 ├── conftest.py                  # shared pytest fixtures (FakeConn, FakeCursor)
 ├── .env.example
@@ -116,7 +118,7 @@ issueops-mcp/
    pip install -r requirements.txt
    cp .env.example .env
    ```
-   Fill in `NEON_DSN` (Neon's pooled connection string, Streamlit reruns the whole script on every interaction and will exhaust a direct connection fast), `GITHUB_READ_PAT`, `GITHUB_WRITE_PAT`, and `GROQ_API_KEY`. `GROQ_API_KEY_FALLBACK` and `LOGFIRE_TOKEN` are optional.
+   Fill in `NEON_DSN` (Neon's pooled connection string, Streamlit reruns the whole script on every interaction and will exhaust a direct connection fast), `GITHUB_READ_PAT`, `GITHUB_WRITE_PAT`, and `GROQ_API_KEY`. `GROQ_API_KEY_FALLBACK` and `LOGFIRE_TOKEN` are optional. Also set `DASHBOARD_ACCESS_TOKEN` before running the dashboard anywhere beyond a trusted local machine (see Guardrails), and optionally `MCP_CLIENT_LABEL` if you run more than one MCP server instance and want `audit_log.initiator` to tell them apart.
 
 3. **Database.** Apply `db/schema.sql` against your Neon database.
 
@@ -167,13 +169,24 @@ On a stock Windows Python install there is usually no `python3.exe`, only `pytho
 ## Known limitations
 
 - Written and syntax-checked (`python -m py_compile` on every file, and the MCP server was instantiated in-process to confirm all ten tools register with correct schemas), but not yet run against a live Neon database or the real GitHub API, and the Claude Desktop side of the interoperability check has not been run yet.
-- The Streamlit approver identity is a free-text name field, not authentication. Anyone with dashboard access can type any name. If you need real access control here, that's separate work this project doesn't cover.
+- The Streamlit approver identity is a free-text name field, not authentication. Anyone who can pass the `DASHBOARD_ACCESS_TOKEN` gate can type any name. `DASHBOARD_ACCESS_TOKEN` is a shared secret, not per-user identity: it stops an unauthenticated stranger from approving actions, but it does not let you tell two token-holders apart, or revoke one of them without rotating the token for everyone. If you need real per-user access control, that's separate work this project doesn't cover.
+- `MCP_CLIENT_LABEL` is a manually-set string, not a verified identity. It's meant to distinguish separate MCP server processes in `audit_log.initiator` (different machines, different Claude Desktop configs), not to authenticate a particular human at the other end of stdio.
 - `propose_assign` validates the assignee syntactically only (a well-formed GitHub login), not against the repo's actual collaborator list. The read PAT's scope doesn't grant access to the collaborators endpoint. GitHub itself rejects an invalid assignee at execute time.
 - The heuristic phrase list in `agent/heuristics.py` is coarse and advisory only. It is not tuned for low false positives and is never part of the approval or execution decision.
 - The repo-label cache in `issueops/tools.py` has a 5-minute TTL. `propose_add_labels` and `propose_remove_labels` retry once against a fresh fetch when a label isn't found in the cached set, so a label created moments earlier isn't wrongly rejected, but the cache can still serve a stale list for up to 5 minutes in other read paths.
 - `search_issues` returns a single page (up to 100 results) since GitHub's Search API paginates differently from the REST list endpoints and has its own rate-limit bucket. `list_issues`, `list_pull_requests`, and `get_issue`'s comment fetch follow `Link` header pagination and return the full result set, capped at 20 pages (2,000 items) as a safety limit.
+- Computing the heuristic flag on the MCP server costs one extra GitHub read per `propose_*` call: `_heuristic_flag_for_issue` fetches the issue to scan its text, and `_queue_proposal` separately fetches it again for the state snapshot. That's two GitHub reads and two `audit_log` rows per proposal instead of one, in exchange for the dashboard's advisory flag actually firing on this path. If that read volume matters at your rate limit, the snapshot fetch and the heuristic fetch could be collapsed into one call.
 
 ## Changelog
+
+Third-pass audit fixes:
+
+- MCP-server-originated `propose_*` calls now compute the heuristic flag from the issue content (`mcp_server/server.py`'s `_heuristic_flag_for_issue`, sharing the new `issueops.tools.issue_plaintext` helper with `agent/triage.py`) before queuing. Previously only the scheduled/cron triage agent set `heuristic_flagged`, so the dashboard's advisory signal never appeared for actions proposed interactively through Claude Desktop.
+- Added an optional `DASHBOARD_ACCESS_TOKEN` shared-secret gate in front of the whole dashboard (`dashboard/app.py`, compared with `secrets.compare_digest`). Previously the only protection was the free-text approver-name field, which was never authentication. If the token is unset, the dashboard now shows a persistent sidebar warning instead of relying on this README to convey the risk.
+- `audit_log.initiator` for MCP-driven calls is no longer the flat constant `"mcp:stdio"`. It now defaults to `mcp:stdio:<hostname>:<pid>`, or `mcp:<MCP_CLIENT_LABEL>` if that env var is set, so calls from different machines or processes are distinguishable in the audit ledger.
+- Pinned `mcp` to `>=2.0,<3` in `requirements.txt` instead of an open lower bound. This project already depends on `mcp.server.mcpserver`, a v2-only module path (`FastMCP` was renamed `MCPServer` and moved there in `mcp` 2.0.0); an unbounded pin would silently break the same way again on a hypothetical v3.
+- Extracted issue-to-plaintext flattening out of `agent/triage.py`'s private `_issue_plaintext` into `issueops.tools.issue_plaintext`, now shared by the triage agent and the MCP server's heuristic check instead of being duplicated.
+- Documented, rather than changed, two things a prior review flagged as bugs and that turned out to be intentional: the `FOR UPDATE` lock in `approve_action` is meant to span the GitHub calls (it's per-row, not a global lock, and that's what prevents double-execution), and `mcp.server.mcpserver` is the correct v2 import path, not a typo for `mcp.server.fastmcp`.
 
 Second-pass audit fixes:
 
@@ -203,6 +216,3 @@ Post-audit structure cleanup:
 - Renamed `tests/test_dashboard_actions.py` to `tests/test_actions.py` to match the moved module, consistent with how every other test file in this repo is named after the module it tests, not the package.
 - `tests/test_actions.py` now uses the shared `FakeConn`/`FakeCursor` from `conftest.py` (extended with a `pending_action_row` parameter) instead of a second, parallel fake DB connection class that duplicated the one already in `conftest.py`.
 - Fixed a `sys.path` bug in `conftest.py`: it inserted `Path(__file__).resolve().parent.parent`, one directory above the project root, copy-pasted from `scripts/allowlist.py` where that offset is correct (that script lives one level deeper). It now inserts `.parent`, the project root itself, matching where `conftest.py` actually sits.
-
-
-

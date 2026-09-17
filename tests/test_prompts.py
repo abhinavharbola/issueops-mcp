@@ -59,6 +59,3 @@ def test_untrusted_block_strips_marker_variants_case_and_whitespace():
     block = build_untrusted_block(issue)
     inner = block[len(UNTRUSTED_START):-len(UNTRUSTED_END)]
     assert "untrusted_issue_content" not in inner.lower()
-
-
-

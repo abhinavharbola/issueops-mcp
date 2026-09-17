@@ -104,6 +104,3 @@ def test_list_issues_stops_when_there_is_no_next_link():
 
     assert [i["number"] for i in issues] == [1]
     assert client._session.request.call_count == 1
-
-
-

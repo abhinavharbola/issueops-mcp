@@ -84,6 +84,3 @@ def test_duplicate_proposal_is_deduped_instead_of_reinserted(monkeypatch):
 
     assert result["id"] == "existing-id"
     assert not any("INSERT INTO pending_actions" in sql for sql, _ in fake_conn.queries)
-
-
-

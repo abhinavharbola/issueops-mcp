@@ -84,6 +84,3 @@ def test_plan_from_classification_skips_empty_fields():
         "assign_to": None,
     }
     assert _plan_from_classification(classification, "owner/repo", 1) == []
-
-
-

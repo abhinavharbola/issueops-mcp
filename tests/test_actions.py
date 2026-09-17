@@ -156,6 +156,3 @@ def test_expire_stale_pending_defaults_to_48_hours():
     actions.expire_stale_pending(conn)
     sql, params = conn.queries[0]
     assert params == (actions.DEFAULT_PENDING_ACTION_TTL_HOURS,)
-
-
-

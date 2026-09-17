@@ -13,6 +13,8 @@ REQUIRED_VARS = [
     "LOGFIRE_TOKEN",
     "PENDING_ACTION_TTL_HOURS",
     "COMMENT_BODY_MAX_CHARS",
+    "MCP_CLIENT_LABEL",
+    "DASHBOARD_ACCESS_TOKEN",
 ]
 
 
@@ -105,4 +107,23 @@ def test_zero_or_negative_comment_max_raises(monkeypatch):
         config.load_config(require_write_pat=False)
 
 
+def test_mcp_client_label_and_dashboard_token_default_to_none(monkeypatch):
+    _clear_env(monkeypatch)
+    _set_minimum_required_env(monkeypatch)
 
+    result = config.load_config(require_write_pat=False)
+
+    assert result.mcp_client_label is None
+    assert result.dashboard_access_token is None
+
+
+def test_mcp_client_label_and_dashboard_token_are_read_from_the_environment(monkeypatch):
+    _clear_env(monkeypatch)
+    _set_minimum_required_env(monkeypatch)
+    monkeypatch.setenv("MCP_CLIENT_LABEL", "laptop-1")
+    monkeypatch.setenv("DASHBOARD_ACCESS_TOKEN", "secret-token")
+
+    result = config.load_config(require_write_pat=False)
+
+    assert result.mcp_client_label == "laptop-1"
+    assert result.dashboard_access_token == "secret-token"
