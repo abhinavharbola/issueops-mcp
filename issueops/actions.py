@@ -126,6 +126,3 @@ def reject_action(conn, action_id: str, approver: str, reason: str | None = None
             action_id, approver, "rejected", reason, 0,
         )
         return {"status": "rejected"}
-
-
-

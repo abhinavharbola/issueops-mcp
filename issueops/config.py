@@ -16,6 +16,8 @@ class Config:
     logfire_token: str | None
     pending_action_ttl_hours: int = 48
     comment_body_max_chars: int = 65536
+    mcp_client_label: str | None = None
+    dashboard_access_token: str | None = None
 
 
 def load_config(require_write_pat: bool = False) -> Config:
@@ -62,7 +64,6 @@ def load_config(require_write_pat: bool = False) -> Config:
         logfire_token=os.environ.get("LOGFIRE_TOKEN") or None,
         pending_action_ttl_hours=optional_int("PENDING_ACTION_TTL_HOURS", 48),
         comment_body_max_chars=optional_int("COMMENT_BODY_MAX_CHARS", 65536),
+        mcp_client_label=os.environ.get("MCP_CLIENT_LABEL") or None,
+        dashboard_access_token=os.environ.get("DASHBOARD_ACCESS_TOKEN") or None,
     )
-
-
-

@@ -28,6 +28,11 @@ def _now_ts() -> float:
     return time.monotonic()
 
 
+def issue_plaintext(issue: dict) -> str:
+    comments_text = " ".join(c.get("body", "") for c in issue.get("comments_detail", []))
+    return f"{issue.get('title', '')} {issue.get('body') or ''} {comments_text}"
+
+
 def check_repo_active(conn, repo: str) -> bool:
     row = conn.execute(
         "SELECT active FROM repo_allowlist WHERE repo = %s", (repo,)
@@ -359,6 +364,3 @@ def propose_close(dsn, read_client, repo, issue_number, reason, initiator, heuri
         validate_fn=validate,
     )
     return {"id": action_id, "preview": f"Close {repo}#{issue_number}: {preview}"}
-
-
-

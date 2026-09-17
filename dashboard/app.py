@@ -1,4 +1,5 @@
 import os
+import secrets
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -23,9 +24,22 @@ write_client = GitHubWriteClient(config.github_write_pat)
 def _fetch_issue_preview(neon_dsn, repo, issue_number):
     return tools.get_issue(neon_dsn, read_client, repo, issue_number, "dashboard:preview")
 
+
+if config.dashboard_access_token:
+    entered_token = st.sidebar.text_input("Access token", type="password", key="dashboard_token")
+    if not secrets.compare_digest(entered_token or "", config.dashboard_access_token):
+        st.sidebar.error("Enter the correct access token to view or act on pending actions.")
+        st.stop()
+else:
+    st.sidebar.warning(
+        "DASHBOARD_ACCESS_TOKEN is not set. Anyone who can reach this app can approve or reject "
+        "actions. Set DASHBOARD_ACCESS_TOKEN in .env before running this anywhere beyond a "
+        "trusted local machine."
+    )
+
 st.sidebar.header("Approver")
 approver = st.sidebar.text_input("Your name or handle", key="approver_name")
-st.sidebar.caption("Not authentication. Anyone with dashboard access can type any name here.")
+st.sidebar.caption("Not authentication by itself. Combine with DASHBOARD_ACCESS_TOKEN for real access control.")
 
 st.title("IssueOps MCP - Pending Actions")
 
@@ -92,6 +106,3 @@ st.subheader("Recent audit log")
 with sync_connection(config.neon_dsn) as conn:
     audit_rows = actions.list_recent_audit_log(conn)
 st.dataframe(audit_rows, use_container_width=True)
-
-
-

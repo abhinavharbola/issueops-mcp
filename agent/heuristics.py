@@ -17,6 +17,3 @@ HEURISTIC_PHRASES = [
 def is_heuristically_flagged(text: str) -> bool:
     lowered = text.lower()
     return any(phrase in lowered for phrase in HEURISTIC_PHRASES)
-
-
-

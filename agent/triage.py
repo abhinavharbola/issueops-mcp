@@ -29,11 +29,6 @@ PROPOSE_DISPATCH = {
 }
 
 
-def _issue_plaintext(issue: dict) -> str:
-    comments_text = " ".join(c.get("body", "") for c in issue.get("comments_detail", []))
-    return f"{issue.get('title', '')} {issue.get('body') or ''} {comments_text}"
-
-
 EMPTY_CLASSIFICATION = {
     "labels_to_add": [],
     "comment": None,
@@ -192,7 +187,7 @@ def run_triage(repo: str, initiator: str, state: str = "open", max_issues: int |
             if issue_number is None:
                 raise ValueError("issue summary is missing a 'number' field")
             issue = tools.get_issue(dsn, read_client, repo, issue_number, initiator)
-            flagged = is_heuristically_flagged(_issue_plaintext(issue))
+            flagged = is_heuristically_flagged(tools.issue_plaintext(issue))
             classification = classify_issue(groq_clients, model, issue)
             plan = _plan_from_classification(classification, repo, issue_number)
 
@@ -248,6 +243,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-

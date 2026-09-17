@@ -40,6 +40,3 @@ CREATE TABLE audit_log (
 CREATE INDEX idx_pending_actions_dedup ON pending_actions (repo, issue_number, tool_name, status);
 CREATE INDEX idx_pending_actions_status_created ON pending_actions (status, created_at DESC);
 CREATE INDEX idx_audit_log_timestamp ON audit_log (timestamp DESC);
-
-
-

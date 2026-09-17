@@ -49,6 +49,3 @@ def build_untrusted_block(issue: dict) -> str:
 
 def build_user_prompt(issue: dict) -> str:
     return f"Classify this issue.\n\n{build_untrusted_block(issue)}"
-
-
-
