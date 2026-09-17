@@ -7,6 +7,7 @@ from psycopg.types.json import Jsonb
 
 from issueops.db import sync_connection
 from issueops.github_client import GitHubReadClient
+from issueops.heuristics import is_heuristically_flagged
 
 VALID_CLOSE_REASONS = {"completed", "not_planned", None}
 
@@ -205,13 +206,17 @@ def _find_existing_pending(conn, repo, issue_number, tool_name, arguments: dict)
     return None
 
 
-def snapshot_issue_state(read_client: GitHubReadClient, repo: str, issue_number: int) -> dict:
-    issue = read_client.get_issue(repo, issue_number)
+def _snapshot_from_issue(issue: dict) -> dict:
     return {
         "state": issue["state"],
         "labels": sorted(l["name"] if isinstance(l, dict) else l for l in issue.get("labels", [])),
         "assignees": sorted(a["login"] for a in issue.get("assignees", [])),
     }
+
+
+def snapshot_issue_state(read_client: GitHubReadClient, repo: str, issue_number: int) -> dict:
+    issue = read_client.get_issue(repo, issue_number)
+    return _snapshot_from_issue(issue)
 
 
 def _queue_proposal(
@@ -246,7 +251,11 @@ def _queue_proposal(
                     )
                     return existing_id, f"duplicate of existing pending action {existing_id}", False
 
-                snapshot = snapshot_issue_state(read_client, repo, issue_number)
+                snapshot_issue = read_client.get_issue(repo, issue_number)
+                snapshot = _snapshot_from_issue(snapshot_issue)
+                heuristic_flagged = heuristic_flagged or is_heuristically_flagged(
+                    issue_plaintext(snapshot_issue)
+                )
 
                 row = conn.execute(
                     """

@@ -17,3 +17,10 @@ def test_does_not_flag_an_ordinary_bug_report():
 def test_every_listed_phrase_actually_triggers_the_flag():
     for phrase in HEURISTIC_PHRASES:
         assert is_heuristically_flagged(f"some text before {phrase} some text after")
+
+
+def test_agent_heuristics_is_a_re_export_of_the_canonical_issueops_module():
+    import issueops.heuristics as canonical
+
+    assert HEURISTIC_PHRASES is canonical.HEURISTIC_PHRASES
+    assert is_heuristically_flagged is canonical.is_heuristically_flagged

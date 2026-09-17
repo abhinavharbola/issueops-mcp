@@ -7,7 +7,6 @@ import requests
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
-from agent.heuristics import is_heuristically_flagged
 from issueops import tools
 from issueops.config import load_config
 from issueops.github_client import GitHubAPIError, GitHubReadClient
@@ -24,14 +23,6 @@ initiator = (
 )
 
 server = MCPServer(name="issueops-mcp")
-
-
-def _heuristic_flag_for_issue(repo: str, issue_number: int) -> bool:
-    try:
-        issue = tools.get_issue(config.neon_dsn, read_client, repo, issue_number, initiator)
-    except Exception:
-        return False
-    return is_heuristically_flagged(tools.issue_plaintext(issue))
 
 
 def _translate_errors(fn):
@@ -111,7 +102,6 @@ def get_repo_activity_summary(repo: str, days: int = 7):
 def propose_add_comment(repo: str, issue_number: int, body: str):
     return tools.propose_add_comment(
         config.neon_dsn, read_client, repo, issue_number, body, initiator,
-        heuristic_flagged=_heuristic_flag_for_issue(repo, issue_number),
         max_body_chars=config.comment_body_max_chars,
     )
 
@@ -119,37 +109,25 @@ def propose_add_comment(repo: str, issue_number: int, body: str):
 @server.tool(description="Queue label additions on an issue for human approval. Does not modify GitHub.")
 @_translate_errors
 def propose_add_labels(repo: str, issue_number: int, labels: list[str]):
-    return tools.propose_add_labels(
-        config.neon_dsn, read_client, repo, issue_number, labels, initiator,
-        heuristic_flagged=_heuristic_flag_for_issue(repo, issue_number),
-    )
+    return tools.propose_add_labels(config.neon_dsn, read_client, repo, issue_number, labels, initiator)
 
 
 @server.tool(description="Queue label removals on an issue for human approval. Does not modify GitHub.")
 @_translate_errors
 def propose_remove_labels(repo: str, issue_number: int, labels: list[str]):
-    return tools.propose_remove_labels(
-        config.neon_dsn, read_client, repo, issue_number, labels, initiator,
-        heuristic_flagged=_heuristic_flag_for_issue(repo, issue_number),
-    )
+    return tools.propose_remove_labels(config.neon_dsn, read_client, repo, issue_number, labels, initiator)
 
 
 @server.tool(description="Queue an assignee for an issue for human approval. Does not modify GitHub.")
 @_translate_errors
 def propose_assign(repo: str, issue_number: int, assignee: str):
-    return tools.propose_assign(
-        config.neon_dsn, read_client, repo, issue_number, assignee, initiator,
-        heuristic_flagged=_heuristic_flag_for_issue(repo, issue_number),
-    )
+    return tools.propose_assign(config.neon_dsn, read_client, repo, issue_number, assignee, initiator)
 
 
 @server.tool(description="Queue closing an issue for human approval. Does not modify GitHub.")
 @_translate_errors
 def propose_close(repo: str, issue_number: int, reason: str | None = None):
-    return tools.propose_close(
-        config.neon_dsn, read_client, repo, issue_number, reason, initiator,
-        heuristic_flagged=_heuristic_flag_for_issue(repo, issue_number),
-    )
+    return tools.propose_close(config.neon_dsn, read_client, repo, issue_number, reason, initiator)
 
 
 if __name__ == "__main__":
