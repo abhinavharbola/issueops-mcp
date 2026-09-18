@@ -49,11 +49,18 @@ if "last_action_result" in st.session_state:
         st.success(f"Executed: {result}")
     elif result["status"] == "rejected":
         st.info(f"Rejected: {result}")
+    elif result["status"] == "lost_lease_after_execution":
+        st.warning(
+            f"The GitHub call for this action went through, but its lease was lost before the "
+            f"outcome could be recorded. Check the issue on GitHub and the audit log directly "
+            f"for a possible duplicate: {result}"
+        )
     else:
         st.error(f"Not executed: {result}")
 
 with sync_connection(config.neon_dsn) as conn:
     actions.expire_stale_pending(conn, ttl_hours=config.pending_action_ttl_hours)
+    actions.recover_stuck_approving(conn, minutes=config.stuck_approving_recovery_minutes)
     pending = actions.list_pending_actions(conn)
 
 if not pending:

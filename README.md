@@ -1,178 +1,155 @@
 # IssueOps MCP
 
-A guarded MCP server for GitHub issue triage. Ten tools on the model-facing surface: five read-only, five that queue a proposal for a human to approve. There is no execute or confirm tool anywhere on that surface, for any client. That is the entire premise of the project.
+An MCP server plus a human-approval layer for GitHub issue triage. An MCP client (Claude Desktop,
+or the scheduled triage agent in `agent/triage.py`) can read issues and *propose* mutating actions
+(add a comment, add or remove labels, assign, close). Nothing is written to GitHub until a human
+approves the proposal in the Streamlit dashboard.
 
-## What this is
+## Why a human approval layer
 
-1. The MCP server (or the standalone triage agent) reads issues, pull requests, and activity summaries through a read-only GitHub PAT.
-2. Any mutating action (comment, add or remove labels, assign, close) is only ever proposed, never executed. Proposing writes a row to `pending_actions` in Postgres, including a snapshot of the issue's state at that moment.
-3. A human reviews pending proposals in the Streamlit dashboard and approves or rejects each one.
-4. Only on approval does the dashboard process, the sole process that ever holds a GitHub write PAT, execute the mutation against GitHub.
-5. Every read, proposal, approval, rejection, and execution is written to `audit_log`, so the log is a ledger of what actually happened, not just what was attempted.
+The MCP server's `propose_*` tools never call GitHub's write API directly. They validate the
+request, snapshot the issue's current state, and insert a row into `pending_actions` in Postgres
+(Neon). A separate write-capable process, the dashboard, executes the row only after a human clicks
+Approve, and only if the issue hasn't changed since the snapshot was taken.
 
-## Architecture
+### Credential separation
 
-```mermaid
-flowchart TD
-    claude[Claude Desktop] -->|stdio| server[mcp_server/server.py]
-    custom[scripts/custom_client.py] -->|stdio| server
-    server --> toolsmod[issueops/tools.py]
+The MCP server and the triage agent only ever hold `GITHUB_READ_PAT`. `issueops/config.py`
+actively drops `GITHUB_WRITE_PAT` from the process environment when `load_config` is called with
+`require_write_pat=False`, so even a read-only process that happened to inherit the write PAT in
+its environment cannot use it. Only the dashboard process, which calls
+`load_config(require_write_pat=True)`, keeps it.
 
-    cron[agent/triage.py] --> toolsmod
+## Approving an action without holding a database lock across GitHub calls
 
-    toolsmod -->|read PAT| githubread[GitHub REST, read only]
-    toolsmod --> neon[(Neon: pending_actions, audit_log)]
+Earlier versions of `approve_action` opened a single Postgres transaction, took a `SELECT ... FOR
+UPDATE` lock on the pending action row, and held that lock open across the GitHub read (re-fetch
+the issue to check for staleness) and GitHub write (execute the action) HTTP calls. That guaranteed
+an action can't be double-executed, but it meant a slow or rate-limited GitHub API call held a
+Postgres backend connection for the whole round trip. On the pooled Neon connection string this
+project recommends (so the dashboard survives Streamlit's constant reruns without exhausting direct
+connections), a long transaction pins a pooled backend for its entire duration, which does not
+scale past a couple of concurrent approvers.
 
-    dashboard[dashboard/app.py] --> actionsmod[issueops/actions.py]
-    actionsmod -->|write PAT| githubwrite[GitHub REST, mutating]
-    actionsmod --> neon
-```
+`approve_action` now works in short phases instead of one long transaction:
 
-`issueops/tools.py` is the only module both the MCP server and the triage agent import. It has zero MCP or Streamlit imports. `GitHubWriteClient` is only ever constructed inside `issueops/actions.py`, called from `dashboard/app.py`, so the write PAT never enters the MCP server's or triage agent's process.
+1. **Claim.** A short transaction takes the row lock, checks it's still `pending`, checks it hasn't
+   passed `PENDING_ACTION_TTL_HOURS`, checks the repo is still active in the allowlist, then flips
+   `status` to `approving`, stamps `claimed_at = now()`, and commits, returning that `claimed_at`
+   value as a lease token. No GitHub calls happen inside this transaction. Once committed, the row
+   is no longer `pending`, so it also disappears from the dashboard's pending list, which keeps a
+   second approver from ever seeing it to begin with.
+2. **Execute.** Outside any transaction, `approve_action` re-fetches the issue to check for
+   staleness, re-checks the lease is still held (`status = 'approving' AND claimed_at = <lease>`),
+   then calls the GitHub write API. Every terminal write (`executed`, `stale`, `failed`) is itself
+   conditioned on `status = 'approving' AND claimed_at = <lease>`, not just on the row's id.
 
-The triage agent, run interactively or from a scheduled job, calls `issueops.tools` directly. It never opens an MCP client session.
+Double-execution across two concurrent human clicks is prevented by the `status = 'pending'` guard
+in the claim step: a second concurrent approve on the same row finds `status != 'pending'` as soon
+as the first claim commits and returns `not_found_or_not_pending` immediately, without needing to
+hold a lock across network I/O.
 
-## Guardrails
+**Crash recovery and the lease.** If the process crashes between claiming a row and finishing it,
+that row is stuck in `approving`. `actions.recover_stuck_approving` resets any row that's been in
+`approving` for longer than `STUCK_APPROVING_RECOVERY_MINUTES` (default 10) back to `pending`, with
+an audit log entry noting the recovery. The dashboard calls this on every page load, the same way
+it already calls `expire_stale_pending`.
 
-- **Credential separation.** The MCP server and triage agent only ever hold `GITHUB_READ_PAT`. `config.py` actively drops `GITHUB_WRITE_PAT` from the process environment when it isn't required, so the guarantee holds for local runs too, not only in environments where the secret was never injected.
-- **No execute path on the model-facing surface.** Every `propose_*` tool queues a row. None of them can mutate GitHub.
-- **Stale check on approval.** Before executing an approved action, the dashboard re-fetches the issue's current state and compares it to the snapshot taken at proposal time. A mismatch marks the action `stale` instead of executing against a possibly outdated issue.
-- **Dedup.** Identical pending proposals (same repo, issue, tool, and normalized arguments) are matched and reused instead of inserted twice.
-- **48-hour TTL.** Pending actions older than the TTL auto-expire rather than executing later against a stale issue. Configurable via `PENDING_ACTION_TTL_HOURS` in `.env` (default `48`); read by `issueops/actions.py` and passed into `expire_stale_pending` and `approve_action`.
-- **Partial-failure tracking.** `propose_remove_labels` runs as sequential per-label DELETE calls. If one fails partway through, `failure_reason` records exactly which labels were removed before the failure, so `audit_log` reflects the real state of the issue on GitHub, not just a generic error.
-- **Heuristic flag is advisory only.** `issueops/heuristics.py` flags issue text containing common prompt-injection phrases and surfaces it in the dashboard as a signal. It is never checked in the approval or execution path and is not a security boundary. It's computed automatically inside `_queue_proposal` (`issueops/tools.py`) from the same issue fetch used to build the state snapshot, so every `propose_*` call is flagged the same way regardless of caller: the MCP server, the scheduled triage agent, or anything else that queues a proposal in the future. Earlier versions only set it from the triage agent, so the dashboard's advisory signal never appeared for the interactive Claude Desktop path, which is the one most exposed to injected issue content.
-- **Dashboard access token.** `DASHBOARD_ACCESS_TOKEN`, if set, gates the whole dashboard behind a shared secret (`secrets.compare_digest`, not a plain `==`) before it shows any pending action or accepts an approve/reject click. If unset, the dashboard still runs, but shows a persistent warning that it has no access control, instead of only documenting that fact in this README.
-- **Row lock spans the GitHub calls in `approve_action`, on purpose.** The `FOR UPDATE` lock taken on a `pending_actions` row during approval is held across the stale-state re-fetch and the GitHub mutation itself. That's what prevents a double-click, or two approvers racing the same row, from executing the same action twice. It's a per-row lock: it doesn't block unrelated pending actions, and it doesn't hold up the rest of the dashboard.
+This recovery is a time-based guess, not a real liveness check, so it is possible in principle for
+it to fire while the original `approve_action` call is still genuinely running (not crashed, just
+slow). If that happens, the lease token protects correctness rather than raw wall-clock timing:
+the original call's re-check right before the GitHub write (and every write after it) is
+conditioned on still holding the exact `claimed_at` lease it was issued. If a second approver has
+since reclaimed the row, those conditional writes affect zero rows and the original call returns
+`lost_lease` (if caught before the GitHub call) or `lost_lease_after_execution` (if the GitHub call
+had already gone out before the lease was found to be lost). The former means nothing was sent to
+GitHub by that call. The latter means it was, and a human needs to check the audit log and the
+issue on GitHub directly for a possible duplicate, since a GitHub API call that already fired can't
+be undone. In practice this is unlikely: the recovery window (10 minutes by default) is generous
+relative to how long a normal `approve_action` call takes (a handful of HTTP calls, each with a
+15 second timeout), so a real crash and a false-positive recovery are very different durations.
+Lower `STUCK_APPROVING_RECOVERY_MINUTES` and this risk shrinks further at the cost of recovering
+genuinely crashed rows more slowly.
 
-## Data model
+## Preventing redundant GitHub fetches during triage
 
-Three tables in Postgres (Neon), defined in [`db/schema.sql`](db/schema.sql):
+`agent/triage.py` fetches each issue once with `tools.get_issue` to classify it. Previously, every
+`propose_*` call the classifier's output triggered would independently re-fetch the same issue
+inside `issueops/tools.py::_queue_proposal`, to build the state snapshot and compute the heuristic
+flag. An issue that produced four proposals (labels, comment, close, assign) cost five full issue
+fetches, each paginating comments, instead of one.
 
-- `repo_allowlist`: which repos the system is allowed to touch, with an `active` flag so a repo can be deactivated without breaking foreign keys on old rows.
-- `pending_actions`: one row per proposed mutation, its arguments, the issue-state snapshot at proposal time, and its status (`pending`, `stale`, `expired`, `blocked`, `executed`, `failed`, `rejected`).
-- `audit_log`: one row per tool call and per proposal-lifecycle event, joined back to `pending_actions` where applicable. This is the ground truth for what happened, not what was attempted.
+`_queue_proposal` now accepts an optional `prefetched_issue`, and every `propose_*` function in
+`issueops/tools.py` takes a matching `issue=` keyword. `agent/triage.py` passes the issue it already
+fetched into `PROPOSE_DISPATCH`, so a triage run does exactly one GitHub fetch per issue regardless
+of how many proposals that issue generates. The MCP server's tool wrappers in `mcp_server/server.py`
+don't pass `issue=`, since each MCP tool call is a one-shot request with no earlier fetch to reuse;
+`_queue_proposal` fetches fresh in that case, same as before.
 
-`db/schema.sql` also defines indexes on `pending_actions`' dedup lookup, `pending_actions`' pending/created-at ordering, and `audit_log`'s timestamp ordering, matching the actual query patterns in `issueops/tools.py`, `issueops/actions.py`, and `dashboard/app.py`.
+## Heuristic flagging
 
-## Safety
+`is_heuristically_flagged` (`issueops/heuristics.py`) is a coarse, advisory-only substring check
+against known prompt-injection phrasing (`ignore previous instructions`, `you are now`, and so on).
+It is computed automatically inside `_queue_proposal` from the same issue fetch used to build the
+state snapshot, so every `propose_*` call is flagged the same way regardless of caller: the MCP
+server, the triage agent, or anything else that queues a proposal in the future. It is not a
+security boundary, an attacker only has to avoid the listed phrases. It exists to give a human
+approver a visible hint in the dashboard, nothing more.
 
-All issue and comment content pulled from GitHub is wrapped in `<untrusted_issue_content>` delimiters (`agent/prompts.py`) before it reaches the triage agent's prompt, with system instructions telling the model to treat it strictly as data, never as instructions to follow, even if it claims to be from a system, developer, administrator, or the assistant itself. This is a prompt-injection mitigation: issue content comes from the open web and is not trusted input.
+## The ten MCP tools
 
-This wrapping applies to the standalone triage agent's prompt only. On the MCP server surface (`mcp_server/server.py`), the tool descriptions for all five read tools (`get_issue`, `list_issues`, `list_pull_requests`, `search_issues`, `get_repo_activity_summary`) instead carry an explicit warning that the returned text is untrusted and must not be treated as instructions, since MCP tool results are returned as raw structured data rather than assembled into a single prompt string. Either way, the actual safety guarantee does not depend on this labeling: nothing on the MCP surface can execute a mutation, so a successful injection can at most produce a bad `propose_*` call, which still lands in `pending_actions` for a human to reject.
+Read (never write to GitHub): `list_issues`, `get_issue`, `list_pull_requests`, `search_issues`,
+`get_repo_activity_summary`.
 
-## Project structure
+Propose (queue a row in `pending_actions`, never write to GitHub): `propose_add_comment`,
+`propose_add_labels`, `propose_remove_labels`, `propose_assign`, `propose_close`.
 
-```
-issueops-mcp/
-├── agent/
-│   ├── heuristics.py            # re-exports issueops.heuristics for backward compatibility
-│   ├── prompts.py               # untrusted-content wrapping for the classifier
-│   └── triage.py                # standalone CLI/cron classifier
-│
-├── dashboard/
-│   └── app.py                   # Streamlit UI only
-│
-├── db/
-│   └── schema.sql               # repo_allowlist, pending_actions, audit_log
-│
-├── eval/
-│   ├── eval.py                  # susceptibility, guarantee check, accuracy
-│   └── labels_template.json     # copy to labels.json, then hand-label
-│
-├── issueops/
-│   ├── actions.py               # approve/reject/execute logic, holds the write PAT
-│   ├── config.py                # env loading, drops write PAT when unused
-│   ├── db.py                    # Neon/Postgres connection helper
-│   ├── github_client.py         # GitHubReadClient, GitHubWriteClient
-│   ├── heuristics.py            # advisory prompt-injection phrase match (canonical location)
-│   ├── observability.py         # Logfire setup, optional
-│   └── tools.py                 # shared by MCP server and triage agent
-│
-├── mcp_server/
-│   └── server.py                # stdio MCP server, ten tools
-│
-├── scripts/
-│   ├── allowlist.py             # add/deactivate/list allowlisted repos
-│   └── custom_client.py         # minimal stdio MCP client for manual testing
-│
-├── tests/
-│   └── test_*.py                # pytest suite, generally one file per module under test
-│
-├── conftest.py                  # shared pytest fixtures (FakeConn, FakeCursor)
-├── .env.example
-├── requirements.txt
-└── README.md
-```
+## Repo allowlist
 
-## Getting started
+Every read and propose tool call checks `repo_allowlist.active` before doing anything else.
+`scripts/allowlist.py` adds or deactivates repos. Deactivating sets `active = false` rather than
+deleting the row, so existing `pending_actions` rows (which have a foreign key on `repo`) aren't
+broken by deactivating a repo they reference.
 
-1. **Services you'll need:**
-   - A Neon Postgres project (free tier): https://neon.tech
-   - A GitHub PAT with read-only access to Issues and PRs
-   - A second GitHub PAT with write access, used only by the dashboard
-   - A Groq API key, and optionally a second account's key as a rate-limit fallback: https://console.groq.com/keys
-   - Logfire (optional, tracing no-ops without it): https://logfire.pydantic.dev
+## Prompt injection handling
 
-2. **Install**
-   ```
-   python -m venv venv && source venv/bin/activate
-   pip install -r requirements.txt
-   cp .env.example .env
-   ```
-   Fill in `NEON_DSN` (Neon's pooled connection string, Streamlit reruns the whole script on every interaction and will exhaust a direct connection fast), `GITHUB_READ_PAT`, `GITHUB_WRITE_PAT`, and `GROQ_API_KEY`. `GROQ_API_KEY_FALLBACK` and `LOGFIRE_TOKEN` are optional. Also set `DASHBOARD_ACCESS_TOKEN` before running the dashboard anywhere beyond a trusted local machine (see Guardrails), and optionally `MCP_CLIENT_LABEL` if you run more than one MCP server instance and want `audit_log.initiator` to tell them apart.
+Issue titles, bodies, and comments are untrusted, external, attacker-controlled text. The classifier
+prompt in `agent/prompts.py` wraps that text in `<untrusted_issue_content>` markers and instructs
+the model to treat it strictly as data. `build_untrusted_block` also strips any occurrence of the
+marker tags themselves out of the issue text first, so an issue body can't inject a fake closing
+marker and smuggle instructions outside the untrusted block.
 
-3. **Database.** Apply `db/schema.sql` against your Neon database.
+## Setup
 
-4. **Allowlist a scratch repo you own:**
-   ```
-   python scripts/allowlist.py add owner/scratch-repo
-   ```
+1. Apply `db/schema.sql` to a Neon Postgres database. Use the **pooled** connection string for
+   `NEON_DSN`, both the dashboard (constant Streamlit reruns) and the MCP server / triage agent
+   (a new connection per tool call) benefit from pooling.
+2. Copy `.env.example` to `.env` and fill in `NEON_DSN`, `GITHUB_READ_PAT`, `GITHUB_WRITE_PAT`,
+   `GROQ_API_KEY`. Set `DASHBOARD_ACCESS_TOKEN` before running the dashboard anywhere beyond a
+   trusted local machine.
+3. `python scripts/allowlist.py add owner/repo`
+4. `pip install -r requirements.txt`
+5. Run the MCP server: `python -m mcp_server.server` (or point Claude Desktop at it).
+6. Run the dashboard: `streamlit run dashboard/app.py`
+7. Run the triage agent on a schedule: `python -m agent.triage owner/repo`
 
-## Running it
+## Testing
 
-```
-python -m mcp_server.server
-python scripts/custom_client.py list_issues '{"repo": "owner/scratch-repo"}'
-streamlit run dashboard/app.py
-python -m agent.triage owner/scratch-repo --max-issues 3
-```
-
-To point Claude Desktop at the server, set its MCP config's `command` to your interpreter, `args` to `["-m", "mcp_server.server"]`, and `cwd` to this repo's absolute path. `config.py` calls `load_dotenv()`, which walks up from the working directory to find `.env`, so with `cwd` set correctly the spawned process picks up your credentials without duplicating them into an explicit `env` block.
-
-```json
-{
-  "mcpServers": {
-    "issueops-mcp": {
-      "command": "python3",
-      "args": ["-m", "mcp_server.server"],
-      "cwd": "/absolute/path/to/issueops-mcp"
-    }
-  }
-}
-```
-
-On a stock Windows Python install there is usually no `python3.exe`, only `python.exe`. Run `python -c "import sys; print(sys.executable)"` to get the right value for `command`.
-
-## Evaluation
-
-1. Copy `eval/labels_template.json` to `eval/labels.json` and hand-label 20 to 30 real issues from a repo you control.
-2. Run:
-   ```
-   python -m eval.eval eval/labels.json
-   ```
-
-`eval/eval.py` computes, honestly, without massaging the numbers:
-
-- **Proposal-level susceptibility.** How often the agent proposed a malicious or nonsensical action on an adversarial issue. Expected to be non-zero.
-- **Execution-level guarantee.** A SQL check that every `audit_log` row recording a completed GitHub mutation is backed by a `pending_actions` row with `status = 'executed'` and a non-null `approved_by`. This scopes strictly to rows with `result_status = 'executed'`, since those are the only rows that assert a real GitHub mutation happened. This number must be zero.
-- **Label accuracy** on the legitimate subset (exact set match, no judge model), and **latency** per triage run.
+`pytest` from the repo root. Tests use `conftest.py`'s `FakeConn`/`FakeCursor` to exercise SQL
+call sequences without a real database, and `unittest.mock.MagicMock` for the GitHub clients.
 
 ## Known limitations
 
-- Written and syntax-checked (`python -m py_compile` on every file, and the MCP server was instantiated in-process to confirm all ten tools register with correct schemas), but not yet run against a live Neon database or the real GitHub API, and the Claude Desktop side of the interoperability check has not been run yet.
-- The Streamlit approver identity is a free-text name field, not authentication. Anyone who can pass the `DASHBOARD_ACCESS_TOKEN` gate can type any name. `DASHBOARD_ACCESS_TOKEN` is a shared secret, not per-user identity: it stops an unauthenticated stranger from approving actions, but it does not let you tell two token-holders apart, or revoke one of them without rotating the token for everyone. If you need real per-user access control, that's separate work this project doesn't cover.
-- `MCP_CLIENT_LABEL` is a manually-set string, not a verified identity. It's meant to distinguish separate MCP server processes in `audit_log.initiator` (different machines, different Claude Desktop configs), not to authenticate a particular human at the other end of stdio.
-- `propose_assign` validates the assignee syntactically only (a well-formed GitHub login), not against the repo's actual collaborator list. The read PAT's scope doesn't grant access to the collaborators endpoint. GitHub itself rejects an invalid assignee at execute time.
-- The heuristic phrase list in `issueops/heuristics.py` is coarse and advisory only. It is not tuned for low false positives and is never part of the approval or execution decision.
-- The repo-label cache in `issueops/tools.py` has a 5-minute TTL. `propose_add_labels` and `propose_remove_labels` retry once against a fresh fetch when a label isn't found in the cached set, so a label created moments earlier isn't wrongly rejected, but the cache can still serve a stale list for up to 5 minutes in other read paths.
-- `search_issues` returns a single page (up to 100 results) since GitHub's Search API paginates differently from the REST list endpoints and has its own rate-limit bucket. `list_issues`, `list_pull_requests`, and `get_issue`'s comment fetch follow `Link` header pagination and return the full result set, capped at 20 pages (2,000 items) as a safety limit.
+- The heuristic flag is advisory only, see above.
+- Approver identity in the dashboard is a free-text name field, not authentication.
+  `DASHBOARD_ACCESS_TOKEN` gates access to the dashboard itself; it does not distinguish between
+  approvers. Treat the audit log's `initiator`/`approved_by` fields as a record of what was typed,
+  not a verified identity.
+- A row stuck in `approving` after a crash is only recovered on the next dashboard page load
+  (`recover_stuck_approving`), not immediately. There's no background worker in this project.
+- The recovery sweep is time-based, not a true liveness check. See the lease discussion above;
+  the narrow `lost_lease_after_execution` case needs a human to check GitHub directly, since the
+  underlying write already happened and can't be rolled back automatically.
+- `propose_remove_labels` executes its GitHub calls sequentially and can partially succeed; the
+  failure message lists which labels were removed, which one failed, and which were never
+  attempted, so a human can finish the job manually.

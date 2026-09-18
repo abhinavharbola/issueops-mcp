@@ -229,6 +229,7 @@ def _queue_proposal(
     initiator: str,
     heuristic_flagged: bool,
     validate_fn=None,
+    prefetched_issue: dict | None = None,
 ) -> tuple[str, str, bool]:
     start = _now_ts()
     with sync_connection(dsn) as conn:
@@ -251,7 +252,7 @@ def _queue_proposal(
                     )
                     return existing_id, f"duplicate of existing pending action {existing_id}", False
 
-                snapshot_issue = read_client.get_issue(repo, issue_number)
+                snapshot_issue = prefetched_issue if prefetched_issue is not None else read_client.get_issue(repo, issue_number)
                 snapshot = _snapshot_from_issue(snapshot_issue)
                 heuristic_flagged = heuristic_flagged or is_heuristically_flagged(
                     issue_plaintext(snapshot_issue)
@@ -289,7 +290,7 @@ def _queue_proposal(
 
 def propose_add_comment(
     dsn, read_client, repo, issue_number, body, initiator, heuristic_flagged=False,
-    max_body_chars: int = DEFAULT_COMMENT_BODY_MAX_CHARS,
+    max_body_chars: int = DEFAULT_COMMENT_BODY_MAX_CHARS, issue: dict | None = None,
 ):
     body = body.strip()
 
@@ -302,12 +303,12 @@ def propose_add_comment(
     arguments = {"body": body}
     action_id, preview, _ = _queue_proposal(
         dsn, read_client, "propose_add_comment", repo, issue_number, arguments, initiator, heuristic_flagged,
-        validate_fn=validate,
+        validate_fn=validate, prefetched_issue=issue,
     )
     return {"id": action_id, "preview": f"Add comment on {repo}#{issue_number}: {preview}"}
 
 
-def propose_add_labels(dsn, read_client, repo, issue_number, labels, initiator, heuristic_flagged=False):
+def propose_add_labels(dsn, read_client, repo, issue_number, labels, initiator, heuristic_flagged=False, issue: dict | None = None):
     def validate():
         if not labels:
             raise ValidationError("labels cannot be empty")
@@ -322,12 +323,12 @@ def propose_add_labels(dsn, read_client, repo, issue_number, labels, initiator, 
     arguments = {"labels": sorted(labels)}
     action_id, preview, _ = _queue_proposal(
         dsn, read_client, "propose_add_labels", repo, issue_number, arguments, initiator, heuristic_flagged,
-        validate_fn=validate,
+        validate_fn=validate, prefetched_issue=issue,
     )
     return {"id": action_id, "preview": f"Add labels {labels} on {repo}#{issue_number}: {preview}"}
 
 
-def propose_remove_labels(dsn, read_client, repo, issue_number, labels, initiator, heuristic_flagged=False):
+def propose_remove_labels(dsn, read_client, repo, issue_number, labels, initiator, heuristic_flagged=False, issue: dict | None = None):
     def validate():
         if not labels:
             raise ValidationError("labels cannot be empty")
@@ -342,12 +343,12 @@ def propose_remove_labels(dsn, read_client, repo, issue_number, labels, initiato
     arguments = {"labels": sorted(labels)}
     action_id, preview, _ = _queue_proposal(
         dsn, read_client, "propose_remove_labels", repo, issue_number, arguments, initiator, heuristic_flagged,
-        validate_fn=validate,
+        validate_fn=validate, prefetched_issue=issue,
     )
     return {"id": action_id, "preview": f"Remove labels {labels} on {repo}#{issue_number}: {preview}"}
 
 
-def propose_assign(dsn, read_client, repo, issue_number, assignee, initiator, heuristic_flagged=False):
+def propose_assign(dsn, read_client, repo, issue_number, assignee, initiator, heuristic_flagged=False, issue: dict | None = None):
     def validate():
         if not assignee or not assignee.strip():
             raise ValidationError("assignee cannot be empty")
@@ -357,12 +358,12 @@ def propose_assign(dsn, read_client, repo, issue_number, assignee, initiator, he
     arguments = {"assignee": assignee}
     action_id, preview, _ = _queue_proposal(
         dsn, read_client, "propose_assign", repo, issue_number, arguments, initiator, heuristic_flagged,
-        validate_fn=validate,
+        validate_fn=validate, prefetched_issue=issue,
     )
     return {"id": action_id, "preview": f"Assign {assignee} on {repo}#{issue_number}: {preview}"}
 
 
-def propose_close(dsn, read_client, repo, issue_number, reason, initiator, heuristic_flagged=False):
+def propose_close(dsn, read_client, repo, issue_number, reason, initiator, heuristic_flagged=False, issue: dict | None = None):
     def validate():
         if reason not in VALID_CLOSE_REASONS:
             raise ValidationError(f"reason must be one of {sorted(r for r in VALID_CLOSE_REASONS if r)} or omitted")
@@ -370,6 +371,6 @@ def propose_close(dsn, read_client, repo, issue_number, reason, initiator, heuri
     arguments = {"reason": reason}
     action_id, preview, _ = _queue_proposal(
         dsn, read_client, "propose_close", repo, issue_number, arguments, initiator, heuristic_flagged,
-        validate_fn=validate,
+        validate_fn=validate, prefetched_issue=issue,
     )
     return {"id": action_id, "preview": f"Close {repo}#{issue_number}: {preview}"}
