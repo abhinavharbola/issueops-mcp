@@ -1,101 +1,114 @@
-from types import SimpleNamespace
+import json
 from unittest.mock import MagicMock
+
+import pytest
 
 import agent.triage as triage
 
 
-def _fake_config():
-    return SimpleNamespace(
-        neon_dsn="postgresql://fake",
-        github_read_pat="fake-read-pat",
-        github_write_pat=None,
-        groq_api_key="fake-groq",
-        groq_api_key_fallback=None,
-        logfire_token=None,
-    )
-
-
-def _patch_common(monkeypatch):
-    monkeypatch.setattr(triage, "load_config", lambda require_write_pat=False: _fake_config())
-    monkeypatch.setattr(triage, "configure_logfire", lambda *a, **k: None)
-    monkeypatch.setattr(triage, "GitHubReadClient", lambda pat: MagicMock())
-    monkeypatch.setattr(triage, "build_groq_clients", lambda config: [MagicMock()])
-
-
-def _empty_classification(groq_clients, model, issue):
+def _issue(number, title="t", body="b"):
     return {
+        "number": number,
+        "title": title,
+        "body": body,
+        "comments_detail": [],
+        "state": "open",
+        "labels": [],
+        "assignees": [],
+    }
+
+
+def _classification(**overrides):
+    base = {
         "labels_to_add": [],
         "comment": None,
         "close_reason": None,
         "assign_to": None,
-        "rationale": "no action",
+        "rationale": "r",
     }
+    base.update(overrides)
+    return base
 
 
-def test_a_failing_issue_does_not_abort_the_batch(monkeypatch):
-    _patch_common(monkeypatch)
-
-    monkeypatch.setattr(
-        triage.tools,
-        "list_issues",
-        lambda dsn, rc, repo, initiator, state="open", labels=None, since=None: [
-            {"number": 1},
-            {"number": 2},
-            {"number": 3},
-        ],
-    )
-
-    def fake_get_issue(dsn, rc, repo, issue_number, initiator):
-        if issue_number == 2:
-            raise RuntimeError("GitHub API exploded")
-        return {"number": issue_number, "title": "t", "body": "b", "comments_detail": []}
-
-    monkeypatch.setattr(triage.tools, "get_issue", fake_get_issue)
-    monkeypatch.setattr(triage, "classify_issue", _empty_classification)
-
-    results = triage.run_triage("owner/repo", initiator="test")
-
-    assert [r["issue_number"] for r in results] == [1, 2, 3]
-    assert results[0].get("error") is None
-    assert "GitHub API exploded" in results[1]["error"]
-    assert results[2].get("error") is None
-    assert results[2]["classification"] is not None
+@pytest.fixture
+def patched(monkeypatch):
+    monkeypatch.setattr(triage, "load_config", MagicMock(return_value=MagicMock(
+        neon_dsn="dsn", github_read_pat="pat", logfire_token=None,
+        groq_api_key="k", groq_api_key_fallback=None,
+    )))
+    monkeypatch.setattr(triage, "configure_logfire", MagicMock())
+    monkeypatch.setattr(triage, "GitHubReadClient", MagicMock())
+    monkeypatch.setattr(triage, "build_groq_clients", MagicMock(return_value=["client"]))
 
 
-def test_a_validation_error_on_one_proposal_does_not_abort_the_issue(monkeypatch):
-    _patch_common(monkeypatch)
+def test_run_triage_skips_pull_requests(monkeypatch, patched):
+    monkeypatch.setattr(triage.tools, "list_issues", MagicMock(return_value=[{"number": 1, "pull_request": {}}]))
+    results = triage.run_triage("owner/repo", "test")
+    assert results == []
 
-    monkeypatch.setattr(
-        triage.tools,
-        "list_issues",
-        lambda dsn, rc, repo, initiator, state="open", labels=None, since=None: [{"number": 1}],
-    )
-    monkeypatch.setattr(
-        triage.tools,
-        "get_issue",
-        lambda dsn, rc, repo, issue_number, initiator: {
-            "number": 1, "title": "t", "body": "b", "comments_detail": [],
-        },
-    )
-    monkeypatch.setattr(
-        triage,
-        "classify_issue",
-        lambda groq_clients, model, issue: {
-            "labels_to_add": [],
-            "comment": None,
-            "close_reason": "garbage-reason",
-            "assign_to": None,
-            "rationale": "r",
-        },
-    )
 
-    def failing_propose_close(dsn, rc, repo, num, args, initiator, flagged):
-        raise triage.tools.ValidationError("reason must be one of completed, not_planned")
+def test_run_triage_records_an_error_when_an_issue_has_no_number(monkeypatch, patched):
+    monkeypatch.setattr(triage.tools, "list_issues", MagicMock(return_value=[{"title": "no number field"}]))
+    results = triage.run_triage("owner/repo", "test")
+    assert len(results) == 1
+    assert results[0]["issue_number"] is None
+    assert "ValueError" in results[0]["error"]
+
+
+def test_run_triage_calls_propose_add_labels_with_the_prefetched_issue(monkeypatch, patched):
+    issue = _issue(1)
+    monkeypatch.setattr(triage.tools, "list_issues", MagicMock(return_value=[{"number": 1}]))
+    monkeypatch.setattr(triage.tools, "get_issue", MagicMock(return_value=issue))
+    monkeypatch.setattr(triage, "classify_issue", MagicMock(return_value=_classification(labels_to_add=["bug"])))
+
+    fake_propose = MagicMock(return_value={"id": "p1", "preview": "..."})
+    monkeypatch.setitem(triage.PROPOSE_DISPATCH, "propose_add_labels", fake_propose)
+
+    results = triage.run_triage("owner/repo", "test")
+
+    assert results[0]["proposals"][0]["result"]["id"] == "p1"
+    fake_propose.assert_called_once_with("dsn", triage.GitHubReadClient.return_value, "owner/repo", 1, {"labels": ["bug"]}, "test", False, issue)
+
+
+def test_run_triage_proposes_multiple_actions_for_one_issue(monkeypatch, patched):
+    issue = _issue(1)
+    monkeypatch.setattr(triage.tools, "list_issues", MagicMock(return_value=[{"number": 1}]))
+    monkeypatch.setattr(triage.tools, "get_issue", MagicMock(return_value=issue))
+    monkeypatch.setattr(triage, "classify_issue", MagicMock(return_value=_classification(labels_to_add=["bug"], comment="hi")))
+
+    fake_add_labels = MagicMock(return_value={"id": "p1", "preview": "..."})
+    fake_add_comment = MagicMock(return_value={"id": "p2", "preview": "..."})
+    monkeypatch.setitem(triage.PROPOSE_DISPATCH, "propose_add_labels", fake_add_labels)
+    monkeypatch.setitem(triage.PROPOSE_DISPATCH, "propose_add_comment", fake_add_comment)
+
+    results = triage.run_triage("owner/repo", "test")
+
+    assert len(results[0]["proposals"]) == 2
+    fake_add_labels.assert_called_once()
+    fake_add_comment.assert_called_once()
+
+
+def test_run_triage_records_a_validation_error_without_aborting_the_issue(monkeypatch, patched):
+    issue = _issue(1)
+    monkeypatch.setattr(triage.tools, "list_issues", MagicMock(return_value=[{"number": 1}]))
+    monkeypatch.setattr(triage.tools, "get_issue", MagicMock(return_value=issue))
+    monkeypatch.setattr(triage, "classify_issue", MagicMock(return_value=_classification(close_reason="completed")))
+
+    def failing_propose_close(dsn, rc, repo, num, args, initiator, flagged, issue):
+        raise triage.tools.ValidationError("bad reason")
 
     monkeypatch.setitem(triage.PROPOSE_DISPATCH, "propose_close", failing_propose_close)
 
-    results = triage.run_triage("owner/repo", initiator="test")
+    results = triage.run_triage("owner/repo", "test")
 
-    assert len(results) == 1
-    assert results[0]["proposals"][0]["tool_name"] == "propose_close"
-    assert "reason must be one of" in results[0]["proposals"][0]["error"]
+    assert results[0]["proposals"][0]["error"] == "bad reason"
+
+
+def test_run_triage_respects_max_issues(monkeypatch, patched):
+    monkeypatch.setattr(triage.tools, "list_issues", MagicMock(return_value=[{"number": 1}, {"number": 2}, {"number": 3}]))
+    monkeypatch.setattr(triage.tools, "get_issue", MagicMock(side_effect=lambda *a, **k: _issue(a[3])))
+    monkeypatch.setattr(triage, "classify_issue", MagicMock(return_value=_classification()))
+
+    results = triage.run_triage("owner/repo", "test", max_issues=2)
+
+    assert len(results) == 2

@@ -14,17 +14,17 @@ from issueops.observability import configure_logfire
 DEFAULT_MODEL = "openai/gpt-oss-20b"
 
 PROPOSE_DISPATCH = {
-    "propose_add_labels": lambda dsn, rc, repo, num, args, initiator, flagged: tools.propose_add_labels(
-        dsn, rc, repo, num, args["labels"], initiator, heuristic_flagged=flagged
+    "propose_add_labels": lambda dsn, rc, repo, num, args, initiator, flagged, issue: tools.propose_add_labels(
+        dsn, rc, repo, num, args["labels"], initiator, heuristic_flagged=flagged, issue=issue
     ),
-    "propose_add_comment": lambda dsn, rc, repo, num, args, initiator, flagged: tools.propose_add_comment(
-        dsn, rc, repo, num, args["body"], initiator, heuristic_flagged=flagged
+    "propose_add_comment": lambda dsn, rc, repo, num, args, initiator, flagged, issue: tools.propose_add_comment(
+        dsn, rc, repo, num, args["body"], initiator, heuristic_flagged=flagged, issue=issue
     ),
-    "propose_close": lambda dsn, rc, repo, num, args, initiator, flagged: tools.propose_close(
-        dsn, rc, repo, num, args.get("reason"), initiator, heuristic_flagged=flagged
+    "propose_close": lambda dsn, rc, repo, num, args, initiator, flagged, issue: tools.propose_close(
+        dsn, rc, repo, num, args.get("reason"), initiator, heuristic_flagged=flagged, issue=issue
     ),
-    "propose_assign": lambda dsn, rc, repo, num, args, initiator, flagged: tools.propose_assign(
-        dsn, rc, repo, num, args["assignee"], initiator, heuristic_flagged=flagged
+    "propose_assign": lambda dsn, rc, repo, num, args, initiator, flagged, issue: tools.propose_assign(
+        dsn, rc, repo, num, args["assignee"], initiator, heuristic_flagged=flagged, issue=issue
     ),
 }
 
@@ -198,7 +198,7 @@ def run_triage(repo: str, initiator: str, state: str = "open", max_issues: int |
                     continue
                 already_called.add(dedup_key)
                 try:
-                    proposal = PROPOSE_DISPATCH[tool_name](dsn, read_client, repo, issue_number, args, initiator, flagged)
+                    proposal = PROPOSE_DISPATCH[tool_name](dsn, read_client, repo, issue_number, args, initiator, flagged, issue)
                     proposals.append({"tool_name": tool_name, "result": proposal})
                 except tools.ValidationError as exc:
                     proposals.append({"tool_name": tool_name, "error": str(exc)})

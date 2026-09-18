@@ -12,6 +12,7 @@ REQUIRED_VARS = [
     "GROQ_API_KEY_FALLBACK",
     "LOGFIRE_TOKEN",
     "PENDING_ACTION_TTL_HOURS",
+    "STUCK_APPROVING_RECOVERY_MINUTES",
     "COMMENT_BODY_MAX_CHARS",
     "MCP_CLIENT_LABEL",
     "DASHBOARD_ACCESS_TOKEN",
@@ -27,6 +28,15 @@ def _set_minimum_required_env(monkeypatch):
     monkeypatch.setenv("NEON_DSN", "postgresql://fake")
     monkeypatch.setenv("GITHUB_READ_PAT", "read-pat")
     monkeypatch.setenv("GROQ_API_KEY", "groq-key")
+
+
+def test_importing_the_module_does_not_touch_the_environment(monkeypatch):
+    monkeypatch.setenv("GITHUB_WRITE_PAT", "should-survive-a-bare-import")
+    import importlib
+
+    importlib.reload(config)
+
+    assert os.environ.get("GITHUB_WRITE_PAT") == "should-survive-a-bare-import"
 
 
 def test_missing_required_var_raises(monkeypatch):
@@ -75,6 +85,7 @@ def test_ttl_and_comment_max_default_when_unset(monkeypatch):
 
     assert result.pending_action_ttl_hours == 48
     assert result.comment_body_max_chars == 65536
+    assert result.stuck_approving_recovery_minutes == 10
 
 
 def test_ttl_and_comment_max_are_read_from_the_environment(monkeypatch):
@@ -82,11 +93,13 @@ def test_ttl_and_comment_max_are_read_from_the_environment(monkeypatch):
     _set_minimum_required_env(monkeypatch)
     monkeypatch.setenv("PENDING_ACTION_TTL_HOURS", "12")
     monkeypatch.setenv("COMMENT_BODY_MAX_CHARS", "1000")
+    monkeypatch.setenv("STUCK_APPROVING_RECOVERY_MINUTES", "3")
 
     result = config.load_config(require_write_pat=False)
 
     assert result.pending_action_ttl_hours == 12
     assert result.comment_body_max_chars == 1000
+    assert result.stuck_approving_recovery_minutes == 3
 
 
 def test_non_integer_ttl_raises(monkeypatch):

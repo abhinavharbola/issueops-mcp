@@ -15,10 +15,11 @@ CREATE TABLE pending_actions (
     heuristic_flagged BOOLEAN DEFAULT false,
     requested_by TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending'
-        CHECK (status IN ('pending', 'rejected', 'expired', 'stale', 'blocked', 'executed', 'failed')),
+        CHECK (status IN ('pending', 'approving', 'rejected', 'expired', 'stale', 'blocked', 'executed', 'failed')),
     approved_by TEXT,
     approved_at TIMESTAMPTZ,
     executed_at TIMESTAMPTZ,
+    claimed_at TIMESTAMPTZ,
     failure_reason TEXT
 );
 
@@ -39,4 +40,5 @@ CREATE TABLE audit_log (
 
 CREATE INDEX idx_pending_actions_dedup ON pending_actions (repo, issue_number, tool_name, status);
 CREATE INDEX idx_pending_actions_status_created ON pending_actions (status, created_at DESC);
+CREATE INDEX idx_pending_actions_approving ON pending_actions (claimed_at) WHERE status = 'approving';
 CREATE INDEX idx_audit_log_timestamp ON audit_log (timestamp DESC);
