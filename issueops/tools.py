@@ -13,8 +13,25 @@ VALID_CLOSE_REASONS = {"completed", "not_planned", None}
 
 DEFAULT_COMMENT_BODY_MAX_CHARS = 65536
 
-_label_cache: dict[str, tuple[float, list[str]]] = {}
-_CACHE_TTL_SECONDS = 300
+class _ProcessLocalTTLCache:
+    def __init__(self, ttl_seconds: float):
+        self._ttl_seconds = ttl_seconds
+        self._entries: dict[str, tuple[float, object]] = {}
+
+    def get_or_fetch(self, key: str, fetch_fn, force_refresh: bool = False):
+        now = _now_ts()
+        cached = self._entries.get(key)
+        if not force_refresh and cached and now - cached[0] < self._ttl_seconds:
+            return cached[1]
+        value = fetch_fn()
+        self._entries[key] = (now, value)
+        return value
+
+    def clear(self):
+        self._entries.clear()
+
+
+_label_cache = _ProcessLocalTTLCache(ttl_seconds=300)
 
 
 class RepoNotAllowedError(Exception):
@@ -170,19 +187,9 @@ def get_repo_activity_summary(dsn, read_client: GitHubReadClient, repo, days, in
     return _run_read_tool(dsn, "get_repo_activity_summary", repo, None, arguments, initiator, compute)
 
 
-def _cached(cache: dict, key: str, fetch_fn, force_refresh: bool = False):
-    now = _now_ts()
-    cached = cache.get(key)
-    if not force_refresh and cached and now - cached[0] < _CACHE_TTL_SECONDS:
-        return cached[1]
-    value = fetch_fn()
-    cache[key] = (now, value)
-    return value
-
-
 def _get_repo_label_names(read_client: GitHubReadClient, repo: str, force_refresh: bool = False) -> list[str]:
-    return _cached(
-        _label_cache, repo, lambda: [l["name"] for l in read_client.get_repo_labels(repo)],
+    return _label_cache.get_or_fetch(
+        repo, lambda: [l["name"] for l in read_client.get_repo_labels(repo)],
         force_refresh=force_refresh,
     )
 

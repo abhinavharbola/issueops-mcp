@@ -114,10 +114,25 @@ def _lease_is_still_held(conn, action_id: str, lease: object) -> bool:
     return row is not None
 
 
-def _finish_with_lease(conn, action_id: str, lease: object, sql: str, params: tuple) -> bool:
+def _finish_with_lease(conn, action_id: str, lease: object, set_sql: str, set_params: tuple = ()) -> bool:
     with conn.transaction():
-        row = conn.execute(sql + " AND status = 'approving' AND claimed_at = %s RETURNING id", params + (lease,)).fetchone()
+        row = conn.execute(
+            f"UPDATE pending_actions {set_sql} WHERE id = %s AND status = 'approving' AND claimed_at = %s RETURNING id",
+            set_params + (action_id, lease),
+        ).fetchone()
         return row is not None
+
+
+def _finish_before_github_call(conn, tool_name, repo, issue_number, arguments, action_id, approver, lease, set_sql, set_params, status, summary):
+    if _finish_with_lease(conn, action_id, lease, set_sql, set_params):
+        tools.write_audit_log(conn, tool_name, repo, issue_number, arguments, action_id, approver, status, summary, 0)
+        return {"status": status, **({"error": summary} if status == "failed" else {})}
+
+    tools.write_audit_log(
+        conn, tool_name, repo, issue_number, arguments, action_id, approver, "lost_lease",
+        "claim was reclaimed before this could be recorded; nothing was sent to GitHub by this call", 0,
+    )
+    return {"status": "lost_lease"}
 
 
 def approve_action(
@@ -133,22 +148,10 @@ def approve_action(
     try:
         current_snapshot = tools.snapshot_issue_state(read_client, repo, issue_number)
     except Exception as exc:
-        _finish_with_lease(
-            conn, action_id, lease,
-            "UPDATE pending_actions SET status = 'failed', failure_reason = %s WHERE id = %s",
-            (str(exc), action_id),
+        return _finish_before_github_call(
+            conn, tool_name, repo, issue_number, arguments, action_id, approver, lease,
+            "SET status = 'failed', failure_reason = %s", (str(exc),), "failed", str(exc),
         )
-        tools.write_audit_log(conn, tool_name, repo, issue_number, arguments, action_id, approver, "failed", str(exc), 0)
-        return {"status": "failed", "error": str(exc)}
-
-    if current_snapshot != row["issue_state_snapshot"]:
-        _finish_with_lease(
-            conn, action_id, lease,
-            "UPDATE pending_actions SET status = 'stale' WHERE id = %s",
-            (action_id,),
-        )
-        tools.write_audit_log(conn, tool_name, repo, issue_number, arguments, action_id, approver, "stale", "issue state diverged from snapshot", 0)
-        return {"status": "stale"}
 
     if not _lease_is_still_held(conn, action_id, lease):
         tools.write_audit_log(
@@ -157,21 +160,30 @@ def approve_action(
         )
         return {"status": "lost_lease"}
 
+    if current_snapshot != row["issue_state_snapshot"]:
+        return _finish_before_github_call(
+            conn, tool_name, repo, issue_number, arguments, action_id, approver, lease,
+            "SET status = 'stale'", (), "stale", "issue state diverged from snapshot",
+        )
+
     try:
         _execute_on_github(write_client, tool_name, repo, issue_number, arguments)
     except Exception as exc:
-        _finish_with_lease(
-            conn, action_id, lease,
-            "UPDATE pending_actions SET status = 'failed', failure_reason = %s WHERE id = %s",
-            (str(exc), action_id),
+        if _finish_with_lease(conn, action_id, lease, "SET status = 'failed', failure_reason = %s", (str(exc),)):
+            tools.write_audit_log(conn, tool_name, repo, issue_number, arguments, action_id, approver, "failed", str(exc), 0)
+            return {"status": "failed", "error": str(exc)}
+
+        tools.write_audit_log(
+            conn, tool_name, repo, issue_number, arguments, action_id, approver, "lost_lease_after_execution",
+            f"the GitHub call raised ({exc}) but the lease was lost before this could be recorded; "
+            "check GitHub and the audit log for a possible duplicate or partial action", 0,
         )
-        tools.write_audit_log(conn, tool_name, repo, issue_number, arguments, action_id, approver, "failed", str(exc), 0)
-        return {"status": "failed", "error": str(exc)}
+        return {"status": "lost_lease_after_execution", "error": str(exc)}
 
     updated = _finish_with_lease(
         conn, action_id, lease,
-        "UPDATE pending_actions SET status = 'executed', approved_by = %s, approved_at = now(), executed_at = now() WHERE id = %s",
-        (approver, action_id),
+        "SET status = 'executed', approved_by = %s, approved_at = now(), executed_at = now()",
+        (approver,),
     )
     if not updated:
         tools.write_audit_log(

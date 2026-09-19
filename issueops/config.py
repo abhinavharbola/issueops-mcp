@@ -19,7 +19,11 @@ class Config:
     dashboard_access_token: str | None = None
 
 
+_write_pat_dropped_in_process = False
+
+
 def load_config(require_write_pat: bool = False) -> Config:
+    global _write_pat_dropped_in_process
     load_dotenv()
 
     def required(name: str) -> str:
@@ -42,10 +46,18 @@ def load_config(require_write_pat: bool = False) -> Config:
 
     write_pat = os.environ.get("GITHUB_WRITE_PAT")
     if require_write_pat and not write_pat:
+        if _write_pat_dropped_in_process:
+            raise RuntimeError(
+                "GITHUB_WRITE_PAT is unavailable because an earlier load_config(require_write_pat=False) "
+                "call in this same process already dropped it from the environment. load_config must not "
+                "be called with require_write_pat=True and require_write_pat=False in the same process; "
+                "run the write-capable entrypoint (the dashboard) in its own process."
+            )
         raise RuntimeError("missing required environment variable: GITHUB_WRITE_PAT")
 
     if not require_write_pat:
         os.environ.pop("GITHUB_WRITE_PAT", None)
+        _write_pat_dropped_in_process = True
         write_pat = None
 
     return Config(

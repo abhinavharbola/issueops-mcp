@@ -12,6 +12,17 @@ class GitHubAPIError(Exception):
         super().__init__(f"GitHub API error {status_code}: {message}")
 
 
+class PaginationLimitExceededError(GitHubAPIError):
+    def __init__(self, path: str, max_pages: int):
+        self.path = path
+        self.max_pages = max_pages
+        super().__init__(
+            0,
+            f"{path} has more than {max_pages} pages of results; refusing to silently "
+            f"truncate. Narrow the query (state, labels, since) or raise max_pages.",
+        )
+
+
 class _BaseClient:
     def __init__(self, token: str):
         self._session = requests.Session()
@@ -50,8 +61,14 @@ class _BaseClient:
             data = response.json()
             if isinstance(data, dict) and "items" in data:
                 results.extend(data["items"])
-            else:
+            elif isinstance(data, list):
                 results.extend(data)
+            else:
+                raise GitHubAPIError(
+                    response.status_code,
+                    f"unexpected response shape for {next_path}: expected a list or a dict "
+                    f"with an 'items' key, got {type(data).__name__}",
+                )
             pages_fetched += 1
 
             next_path = None
@@ -70,6 +87,9 @@ class _BaseClient:
                     next_path = next_url[len(GITHUB_API_BASE):]
                     next_params = None
                     break
+
+        if next_path is not None:
+            raise PaginationLimitExceededError(path, max_pages)
 
         return results
 
