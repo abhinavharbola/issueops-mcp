@@ -143,6 +143,52 @@ def test_approve_action_flags_a_lost_lease_discovered_only_after_the_github_call
     write_client.add_comment.assert_called_once()
 
 
+def test_approve_action_reports_lost_lease_not_stale_when_lease_reclaimed_before_staleness_check():
+    row = _pending_row(issue_state_snapshot={"state": "open", "labels": [], "assignees": []})
+    conn = FakeConn(pending_action_row=row, lease_held=False)
+    read_client = _read_client(snapshot={"state": "closed", "labels": [], "assignees": []})
+    write_client = MagicMock()
+
+    result = actions.approve_action(conn, read_client, write_client, "action-1", "alice")
+
+    assert result["status"] == "lost_lease"
+    write_client.add_comment.assert_not_called()
+    assert not any("status = 'stale'" in sql for sql, _ in conn.queries)
+
+
+def test_approve_action_reports_lost_lease_not_failed_when_lease_reclaimed_before_fetch_raises():
+    row = _pending_row()
+    conn = FakeConn(pending_action_row=row, lease_held=False)
+    read_client = MagicMock()
+    read_client.get_issue.side_effect = RuntimeError("GitHub unreachable")
+    write_client = MagicMock()
+
+    result = actions.approve_action(conn, read_client, write_client, "action-1", "alice")
+
+    assert result["status"] == "lost_lease"
+    write_client.add_comment.assert_not_called()
+    audit_inserts = [params for sql, params in conn.queries if "INSERT INTO audit_log" in sql]
+    assert not any(params[6] == "failed" for params in audit_inserts)
+    assert any(params[6] == "lost_lease" for params in audit_inserts)
+
+
+def test_approve_action_flags_a_lost_lease_when_github_call_raises_after_lease_lost():
+    row = _pending_row()
+    conn = FakeConn(pending_action_row=row)
+    write_client = MagicMock()
+
+    def drop_lease_and_raise(*args, **kwargs):
+        conn.lease_held = False
+        raise RuntimeError("GitHub 500")
+
+    write_client.add_comment.side_effect = drop_lease_and_raise
+
+    result = actions.approve_action(conn, _read_client(), write_client, "action-1", "alice")
+
+    assert result["status"] == "lost_lease_after_execution"
+    assert "GitHub 500" in result["error"]
+
+
 def test_approve_action_marks_failed_when_the_stale_check_fetch_raises():
     row = _pending_row()
     conn = FakeConn(pending_action_row=row)

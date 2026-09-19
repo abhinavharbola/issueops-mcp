@@ -19,6 +19,13 @@ REQUIRED_VARS = [
 ]
 
 
+@pytest.fixture(autouse=True)
+def _reset_write_pat_dropped_flag():
+    config._write_pat_dropped_in_process = False
+    yield
+    config._write_pat_dropped_in_process = False
+
+
 def _clear_env(monkeypatch):
     for name in REQUIRED_VARS:
         monkeypatch.delenv(name, raising=False)
@@ -64,6 +71,16 @@ def test_write_pat_required_but_missing_raises(monkeypatch):
     _set_minimum_required_env(monkeypatch)
 
     with pytest.raises(RuntimeError):
+        config.load_config(require_write_pat=True)
+
+
+def test_write_pat_required_after_a_prior_drop_in_the_same_process_raises_a_clear_error(monkeypatch):
+    _clear_env(monkeypatch)
+    _set_minimum_required_env(monkeypatch)
+    monkeypatch.setenv("GITHUB_WRITE_PAT", "write-pat")
+    config.load_config(require_write_pat=False)
+
+    with pytest.raises(RuntimeError, match="same process"):
         config.load_config(require_write_pat=True)
 
 

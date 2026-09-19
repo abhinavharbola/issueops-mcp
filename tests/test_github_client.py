@@ -2,7 +2,12 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from issueops.github_client import GitHubAPIError, GitHubReadClient, GitHubWriteClient
+from issueops.github_client import (
+    GitHubAPIError,
+    GitHubReadClient,
+    GitHubWriteClient,
+    PaginationLimitExceededError,
+)
 
 
 def _mock_response(status_code, json_data=None, text="", headers=None):
@@ -104,3 +109,27 @@ def test_list_issues_stops_when_there_is_no_next_link():
 
     assert [i["number"] for i in issues] == [1]
     assert client._session.request.call_count == 1
+
+
+def test_paginated_get_raises_instead_of_silently_truncating():
+    client = GitHubReadClient("fake-pat")
+    always_next = _mock_response(
+        200,
+        json_data=[{"number": 1}],
+        headers={"Link": '<https://api.github.com/repos/owner/repo/issues?page=2>; rel="next"'},
+    )
+    client._session.request = MagicMock(return_value=always_next)
+
+    with pytest.raises(PaginationLimitExceededError) as exc_info:
+        client._paginated_get("/repos/owner/repo/issues", {}, max_pages=3)
+
+    assert client._session.request.call_count == 3
+    assert "3 pages" in str(exc_info.value)
+
+
+def test_paginated_get_rejects_an_unexpected_response_shape():
+    client = GitHubReadClient("fake-pat")
+    client._session.request = MagicMock(return_value=_mock_response(200, json_data={"unexpected": "shape"}))
+
+    with pytest.raises(GitHubAPIError):
+        client._paginated_get("/repos/owner/repo/labels", {})

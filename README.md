@@ -39,10 +39,17 @@ scale past a couple of concurrent approvers.
    value as a lease token. No GitHub calls happen inside this transaction. Once committed, the row
    is no longer `pending`, so it also disappears from the dashboard's pending list, which keeps a
    second approver from ever seeing it to begin with.
-2. **Execute.** Outside any transaction, `approve_action` re-fetches the issue to check for
-   staleness, re-checks the lease is still held (`status = 'approving' AND claimed_at = <lease>`),
-   then calls the GitHub write API. Every terminal write (`executed`, `stale`, `failed`) is itself
-   conditioned on `status = 'approving' AND claimed_at = <lease>`, not just on the row's id.
+2. **Execute.** Outside any transaction, `approve_action` re-fetches the issue, then re-checks the
+   lease is still held (`status = 'approving' AND claimed_at = <lease>`) before trusting the
+   staleness comparison against that fetch, then calls the GitHub write API. The lease is checked
+   before the staleness comparison, not after: if the lease was reclaimed by another approver, the
+   issue may have changed for reasons that have nothing to do with the *original* pending action,
+   so that case is reported as `lost_lease`, not `stale`. Every terminal write (`executed`, `stale`,
+   `failed`) is itself conditioned on `status = 'approving' AND claimed_at = <lease>`, not just on
+   the row's id; a phase that runs before the GitHub call and finds that conditional write affects
+   zero rows reports `lost_lease` (nothing was sent to GitHub by this call), while a phase that
+   runs after the GitHub call reports `lost_lease_after_execution` instead, since a GitHub call may
+   already have gone out.
 
 Double-execution across two concurrent human clicks is prevented by the `status = 'pending'` guard
 in the claim step: a second concurrent approve on the same row finds `status != 'pending'` as soon
@@ -153,3 +160,16 @@ call sequences without a real database, and `unittest.mock.MagicMock` for the Gi
 - `propose_remove_labels` executes its GitHub calls sequentially and can partially succeed; the
   failure message lists which labels were removed, which one failed, and which were never
   attempted, so a human can finish the job manually.
+- `load_config` assumes one PAT role per process: the MCP server and triage agent call it with
+  `require_write_pat=False`, the dashboard with `require_write_pat=True`, each in its own process.
+  Calling it both ways in the same process raises a `RuntimeError` explaining why, rather than
+  silently returning a `Config` without the write PAT.
+- The repo label cache in `issueops/tools.py` (`_label_cache`) is process-local with a 5 minute
+  TTL. It is not shared or invalidated across multiple MCP server or triage agent processes; if
+  you ever run more than one worker of either, each holds its own view of a repo's labels for up
+  to 5 minutes.
+- `GitHubReadClient._paginated_get` raises `PaginationLimitExceededError` instead of silently
+  truncating when a repo has more result pages than `max_pages` (default 20, i.e. 2000 items).
+  A very active repo can therefore make `list_issues`, `search_issues`, or
+  `get_repo_activity_summary` fail loudly rather than quietly under-report; narrow the query
+  (state, labels, `since`, a shorter `days` window) or pass a higher `max_pages`.
