@@ -96,7 +96,7 @@ def test_two_concurrent_approvals_execute_the_action_exactly_once(dsn):
 
 
 def test_a_lease_reclaimed_during_the_github_call_is_reported_not_recorded_as_success(dsn):
-    action_id = _insert_pending()
+    action_id = _insert_pending(dsn)
     read_client = _read_client()
     write_client = MagicMock()
 
