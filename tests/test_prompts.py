@@ -59,3 +59,52 @@ def test_untrusted_block_strips_marker_variants_case_and_whitespace():
     block = build_untrusted_block(issue)
     inner = block[len(UNTRUSTED_START):-len(UNTRUSTED_END)]
     assert "untrusted_issue_content" not in inner.lower()
+
+
+def test_context_block_lists_state_labels_assignees_and_repo_lists():
+    from agent.prompts import build_context_block
+
+    issue = {"state": "open", "labels": [{"name": "bug"}], "assignees": [{"login": "alice"}]}
+
+    block = build_context_block(issue, ["bug", "docs"], ["alice", "bob"])
+
+    assert "state: open" in block
+    assert "labels already on the issue: bug" in block
+    assert "current assignees: alice" in block
+    assert "labels that exist on the repo: bug, docs" in block
+    assert "users who can be assigned: alice, bob" in block
+
+
+def test_context_block_omits_repo_lists_when_not_provided_and_shows_none_for_empty():
+    from agent.prompts import build_context_block
+
+    block = build_context_block({"state": "closed", "labels": [], "assignees": []})
+
+    assert "labels already on the issue: (none)" in block
+    assert "labels that exist on the repo" not in block
+    assert "users who can be assigned" not in block
+
+
+def test_context_block_truncates_very_long_lists():
+    from agent.prompts import MAX_CONTEXT_ITEMS, build_context_block
+
+    names = [f"label-{i}" for i in range(MAX_CONTEXT_ITEMS + 5)]
+
+    block = build_context_block({"state": "open"}, names, None)
+
+    assert "and 5 more" in block
+
+
+def test_user_prompt_puts_trusted_context_before_the_untrusted_block():
+    from agent.prompts import build_user_prompt
+
+    prompt = build_user_prompt({"title": "t", "body": "b", "state": "open"}, ["bug"], ["alice"])
+
+    assert prompt.index("Trusted repository context") < prompt.index("<untrusted_issue_content>")
+
+
+def test_system_prompt_tells_the_model_to_use_only_listed_labels_and_users():
+    from agent.prompts import SYSTEM_PROMPT
+
+    assert "labels that exist on the repo" in SYSTEM_PROMPT
+    assert "users who can be assigned" in SYSTEM_PROMPT

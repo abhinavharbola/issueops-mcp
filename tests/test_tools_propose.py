@@ -6,11 +6,20 @@ import issueops.tools as tools
 from conftest import FakeConn, sync_connection_returning
 
 
+@pytest.fixture(autouse=True)
+def _clear_tool_caches():
+    tools._label_cache.clear()
+    tools._assignee_cache.clear()
+    yield
+    tools._label_cache.clear()
+    tools._assignee_cache.clear()
+
+
 def _patch_sync_connection(monkeypatch, fake_conn):
     monkeypatch.setattr(tools, "sync_connection", sync_connection_returning(fake_conn))
 
 
-def _read_client(get_issue_return=None, labels=None):
+def _read_client(get_issue_return=None, labels=None, assignees=("octocat",)):
     client = MagicMock()
     client.get_issue.return_value = get_issue_return or {
         "state": "open",
@@ -18,6 +27,7 @@ def _read_client(get_issue_return=None, labels=None):
         "assignees": [],
     }
     client.get_repo_labels.return_value = [{"name": name} for name in (labels or [])]
+    client.get_repo_assignees.return_value = [{"login": login} for login in assignees]
     return client
 
 
@@ -188,5 +198,105 @@ def test_propose_assign_with_a_prefetched_issue_uses_it_for_the_snapshot(monkeyp
     tools.propose_assign("dsn", read_client, "owner/repo", 1, "octocat", "test", issue=prefetched)
 
     snapshot = _insert_params(fake_conn)[4]
-    assert snapshot.obj == {"state": "closed", "labels": ["bug"], "assignees": ["octocat"]}
+    assert snapshot.obj == {
+        "state": "closed", "labels": ["bug"], "assignees": ["octocat"],
+        "content_hash": tools.content_hash("t", "b"),
+    }
     read_client.get_issue.assert_not_called()
+
+
+def test_propose_assign_rejects_a_login_that_cannot_be_assigned(monkeypatch):
+    _patch_sync_connection(monkeypatch, FakeConn())
+    read_client = _read_client(assignees=("someone-else",))
+
+    with pytest.raises(tools.ValidationError, match="not an assignable user"):
+        tools.propose_assign("dsn", read_client, "owner/repo", 1, "octocat", "test")
+
+
+def test_propose_assign_matches_logins_case_insensitively(monkeypatch):
+    fake_conn = FakeConn(new_id="a-1")
+    _patch_sync_connection(monkeypatch, fake_conn)
+
+    result = tools.propose_assign("dsn", _read_client(assignees=("OctoCat",)), "owner/repo", 1, "octocat", "test")
+
+    assert result["id"] == "a-1"
+
+
+def test_propose_assign_refreshes_a_stale_assignee_cache_once_before_rejecting(monkeypatch):
+    _patch_sync_connection(monkeypatch, FakeConn())
+    read_client = _read_client(assignees=("someone-else",))
+
+    with pytest.raises(tools.ValidationError):
+        tools.propose_assign("dsn", read_client, "owner/repo", 1, "octocat", "test")
+
+    assert read_client.get_repo_assignees.call_count == 2
+
+
+def test_no_github_call_happens_inside_the_database_transaction(monkeypatch):
+    fake_conn = FakeConn(new_id="t-1")
+    _patch_sync_connection(monkeypatch, fake_conn)
+    seen = []
+    read_client = _read_client(labels=["bug"])
+    original_get_issue = read_client.get_issue.return_value
+
+    def get_issue(*args, **kwargs):
+        seen.append(fake_conn.in_transaction)
+        return original_get_issue
+
+    def get_repo_labels(*args, **kwargs):
+        seen.append(fake_conn.in_transaction)
+        return [{"name": "bug"}]
+
+    read_client.get_issue.side_effect = get_issue
+    read_client.get_repo_labels.side_effect = get_repo_labels
+
+    tools.propose_add_labels("dsn", read_client, "owner/repo", 1, ["bug"], "test")
+
+    assert seen == [False, False]
+
+
+def test_a_full_per_issue_queue_rejects_new_proposals_without_fetching_the_issue(monkeypatch):
+    fake_conn = FakeConn(pending_per_issue=tools.DEFAULT_MAX_PENDING_PER_ISSUE)
+    _patch_sync_connection(monkeypatch, fake_conn)
+    read_client = _read_client()
+
+    with pytest.raises(tools.ValidationError, match="pending actions"):
+        tools.propose_close("dsn", read_client, "owner/repo", 1, "completed", "test")
+
+    read_client.get_issue.assert_not_called()
+
+
+def test_a_full_per_initiator_queue_rejects_new_proposals(monkeypatch):
+    fake_conn = FakeConn(pending_per_initiator=tools.DEFAULT_MAX_PENDING_PER_INITIATOR)
+    _patch_sync_connection(monkeypatch, fake_conn)
+
+    with pytest.raises(tools.ValidationError, match="test already has"):
+        tools.propose_close("dsn", _read_client(), "owner/repo", 1, "completed", "test")
+
+
+def test_the_pending_caps_can_be_overridden_from_the_environment(monkeypatch):
+    monkeypatch.setenv("MAX_PENDING_PER_ISSUE", "2")
+    _patch_sync_connection(monkeypatch, FakeConn(pending_per_issue=2))
+
+    with pytest.raises(tools.ValidationError, match="limit 2"):
+        tools.propose_close("dsn", _read_client(), "owner/repo", 1, "completed", "test")
+
+
+def test_an_invalid_pending_cap_value_fails_loudly(monkeypatch):
+    monkeypatch.setenv("MAX_PENDING_PER_ISSUE", "zero")
+    _patch_sync_connection(monkeypatch, FakeConn())
+
+    with pytest.raises(RuntimeError, match="MAX_PENDING_PER_ISSUE"):
+        tools.propose_close("dsn", _read_client(), "owner/repo", 1, "completed", "test")
+
+
+def test_the_snapshot_records_a_content_hash_of_the_title_and_body(monkeypatch):
+    fake_conn = FakeConn(new_id="h-1")
+    _patch_sync_connection(monkeypatch, fake_conn)
+    read_client = _read_client(get_issue_return={
+        "state": "open", "labels": [], "assignees": [], "title": "t", "body": "b",
+    })
+
+    tools.propose_close("dsn", read_client, "owner/repo", 1, "completed", "test")
+
+    assert _insert_params(fake_conn)[4].obj["content_hash"] == tools.content_hash("t", "b")

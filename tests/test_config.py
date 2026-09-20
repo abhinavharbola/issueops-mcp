@@ -16,7 +16,16 @@ REQUIRED_VARS = [
     "COMMENT_BODY_MAX_CHARS",
     "MCP_CLIENT_LABEL",
     "DASHBOARD_ACCESS_TOKEN",
+    "ISSUEOPS_ENV_FILE",
 ]
+
+
+@pytest.fixture(autouse=True)
+def _restore_environment():
+    saved = dict(os.environ)
+    yield
+    os.environ.clear()
+    os.environ.update(saved)
 
 
 @pytest.fixture(autouse=True)
@@ -157,3 +166,70 @@ def test_mcp_client_label_and_dashboard_token_are_read_from_the_environment(monk
 
     assert result.mcp_client_label == "laptop-1"
     assert result.dashboard_access_token == "secret-token"
+
+
+def test_groq_key_is_optional_by_default(monkeypatch):
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("NEON_DSN", "postgresql://fake")
+    monkeypatch.setenv("GITHUB_READ_PAT", "read-pat")
+
+    result = config.load_config()
+
+    assert result.groq_api_key is None
+
+
+def test_groq_key_is_required_when_asked_for(monkeypatch):
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("NEON_DSN", "postgresql://fake")
+    monkeypatch.setenv("GITHUB_READ_PAT", "read-pat")
+
+    with pytest.raises(RuntimeError, match="GROQ_API_KEY"):
+        config.load_config(require_groq=True)
+
+
+def test_groq_key_is_returned_when_present_and_required(monkeypatch):
+    _clear_env(monkeypatch)
+    _set_minimum_required_env(monkeypatch)
+
+    assert config.load_config(require_groq=True).groq_api_key == "groq-key"
+
+
+def _write_env_file(tmp_path, monkeypatch):
+    path = tmp_path / "issueops.env"
+    path.write_text("NEON_DSN=postgresql://from-file\nGITHUB_READ_PAT=read-from-file\nGITHUB_WRITE_PAT=write-from-file\n")
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("ISSUEOPS_ENV_FILE", str(path))
+
+
+def test_a_read_only_process_never_loads_the_write_pat_from_the_env_file(tmp_path, monkeypatch):
+    _write_env_file(tmp_path, monkeypatch)
+
+    result = config.load_config(require_write_pat=False)
+
+    assert result.neon_dsn == "postgresql://from-file"
+    assert result.github_read_pat == "read-from-file"
+    assert result.github_write_pat is None
+    assert "GITHUB_WRITE_PAT" not in os.environ
+
+
+def test_the_write_capable_process_loads_the_write_pat_from_the_env_file(tmp_path, monkeypatch):
+    _write_env_file(tmp_path, monkeypatch)
+
+    result = config.load_config(require_write_pat=True)
+
+    assert result.github_write_pat == "write-from-file"
+
+
+def test_a_prior_read_only_load_blocks_a_later_write_load_even_when_the_env_file_has_the_pat(tmp_path, monkeypatch):
+    _write_env_file(tmp_path, monkeypatch)
+    config.load_config(require_write_pat=False)
+
+    with pytest.raises(RuntimeError, match="same process"):
+        config.load_config(require_write_pat=True)
+
+
+def test_real_environment_variables_win_over_the_env_file(tmp_path, monkeypatch):
+    _write_env_file(tmp_path, monkeypatch)
+    monkeypatch.setenv("NEON_DSN", "postgresql://from-real-env")
+
+    assert config.load_config().neon_dsn == "postgresql://from-real-env"

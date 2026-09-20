@@ -2,8 +2,10 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 import pytest
+import requests
 
 import issueops.actions as actions
+import issueops.tools as tools
 from conftest import FakeConn
 
 
@@ -11,6 +13,7 @@ def _pending_row(**overrides):
     row = {
         "id": "action-1",
         "created_at": datetime.now(timezone.utc),
+        "db_now": datetime.now(timezone.utc),
         "tool_name": "propose_add_comment",
         "repo": "owner/repo",
         "issue_number": 5,
@@ -21,13 +24,14 @@ def _pending_row(**overrides):
     return row
 
 
-def _read_client(snapshot=None):
+def _read_client(snapshot=None, comments=None):
     client = MagicMock()
     client.get_issue.return_value = snapshot or {
         "state": "open",
         "labels": [],
         "assignees": [],
     }
+    client.get_issue_comments.return_value = comments or []
     return client
 
 
@@ -70,8 +74,8 @@ def test_approve_action_blocks_when_repo_is_not_active():
     write_client.add_comment.assert_not_called()
 
 
-def test_approve_action_marks_stale_when_snapshot_diverges():
-    row = _pending_row(issue_state_snapshot={"state": "open", "labels": [], "assignees": []})
+def test_approve_close_is_stale_when_the_issue_is_no_longer_open():
+    row = _pending_row(tool_name="propose_close", arguments={"reason": "completed"})
     conn = FakeConn(pending_action_row=row)
     read_client = _read_client(snapshot={"state": "closed", "labels": [], "assignees": []})
     write_client = MagicMock()
@@ -79,7 +83,135 @@ def test_approve_action_marks_stale_when_snapshot_diverges():
     result = actions.approve_action(conn, read_client, write_client, "action-1", "alice")
 
     assert result["status"] == "stale"
+    write_client.close.assert_not_called()
+
+
+def test_approve_marks_any_action_stale_when_the_title_or_body_changed():
+    row = _pending_row(
+        issue_state_snapshot={
+            "state": "open", "labels": [], "assignees": [],
+            "content_hash": tools.content_hash("t", "original body"),
+        }
+    )
+    conn = FakeConn(pending_action_row=row)
+    read_client = _read_client(snapshot={
+        "state": "open", "labels": [], "assignees": [], "title": "t", "body": "edited body",
+    })
+    write_client = MagicMock()
+
+    result = actions.approve_action(conn, read_client, write_client, "action-1", "alice")
+
+    assert result["status"] == "stale"
+    assert "title or body" in result["error"]
     write_client.add_comment.assert_not_called()
+
+
+def test_approve_still_executes_when_the_title_and_body_are_unchanged():
+    row = _pending_row(
+        issue_state_snapshot={
+            "state": "open", "labels": [], "assignees": [],
+            "content_hash": tools.content_hash("t", "b"),
+        }
+    )
+    conn = FakeConn(pending_action_row=row)
+    read_client = _read_client(snapshot={
+        "state": "open", "labels": [], "assignees": [], "title": "t", "body": "b",
+    })
+    write_client = MagicMock()
+
+    result = actions.approve_action(conn, read_client, write_client, "action-1", "alice")
+
+    assert result["status"] == "executed"
+
+
+def test_a_sibling_action_stays_approvable_after_another_action_changed_labels_and_assignees():
+    row = _pending_row(
+        tool_name="propose_assign",
+        arguments={"assignee": "octocat"},
+        issue_state_snapshot={"state": "open", "labels": [], "assignees": []},
+    )
+    conn = FakeConn(pending_action_row=row)
+    read_client = _read_client(snapshot={"state": "open", "labels": ["bug"], "assignees": []})
+    write_client = MagicMock()
+    write_client.assign.return_value = {"assignees": [{"login": "octocat"}]}
+
+    result = actions.approve_action(conn, read_client, write_client, "action-1", "alice")
+
+    assert result["status"] == "executed"
+    write_client.assign.assert_called_once_with("owner/repo", 5, "octocat")
+
+
+def test_remove_labels_is_stale_when_a_label_is_already_gone():
+    row = _pending_row(tool_name="propose_remove_labels", arguments={"labels": ["bug", "wontfix"]})
+    conn = FakeConn(pending_action_row=row)
+    read_client = _read_client(snapshot={"state": "open", "labels": ["bug"], "assignees": []})
+    write_client = MagicMock()
+
+    result = actions.approve_action(conn, read_client, write_client, "action-1", "alice")
+
+    assert result["status"] == "stale"
+    write_client.remove_label.assert_not_called()
+
+
+def test_add_comment_is_stale_when_an_identical_comment_already_exists():
+    row = _pending_row(arguments={"body": "looks good"})
+    conn = FakeConn(pending_action_row=row)
+    read_client = _read_client(comments=[{"body": "  looks good\n"}])
+    write_client = MagicMock()
+
+    result = actions.approve_action(conn, read_client, write_client, "action-1", "alice")
+
+    assert result["status"] == "stale"
+    assert "identical comment" in result["error"]
+    write_client.add_comment.assert_not_called()
+
+
+def test_add_comment_still_posts_when_existing_comments_differ():
+    row = _pending_row(arguments={"body": "looks good"})
+    conn = FakeConn(pending_action_row=row)
+    read_client = _read_client(comments=[{"body": "something else"}])
+    write_client = MagicMock()
+
+    result = actions.approve_action(conn, read_client, write_client, "action-1", "alice")
+
+    assert result["status"] == "executed"
+
+
+def test_a_network_failure_during_the_write_is_reported_as_outcome_unknown():
+    row = _pending_row()
+    conn = FakeConn(pending_action_row=row)
+    write_client = MagicMock()
+    write_client.add_comment.side_effect = requests.exceptions.ReadTimeout("timed out")
+
+    result = actions.approve_action(conn, _read_client(), write_client, "action-1", "alice")
+
+    assert result["status"] == "failed"
+    assert result["outcome_unknown"] is True
+    assert "outcome unknown" in result["error"]
+
+
+def test_an_http_error_from_github_is_not_reported_as_outcome_unknown():
+    row = _pending_row()
+    conn = FakeConn(pending_action_row=row)
+    write_client = MagicMock()
+    write_client.add_comment.side_effect = RuntimeError("GitHub 422")
+
+    result = actions.approve_action(conn, _read_client(), write_client, "action-1", "alice")
+
+    assert result["status"] == "failed"
+    assert "outcome_unknown" not in result
+
+
+def test_assign_fails_when_github_did_not_actually_apply_the_assignee():
+    row = _pending_row(tool_name="propose_assign", arguments={"assignee": "octocat"})
+    conn = FakeConn(pending_action_row=row)
+    write_client = MagicMock()
+    write_client.assign.return_value = {"assignees": []}
+
+    result = actions.approve_action(conn, _read_client(), write_client, "action-1", "alice")
+
+    assert result["status"] == "failed"
+    assert "not an assignee" in result["error"]
 
 
 def test_approve_action_executes_on_success():
@@ -306,3 +438,37 @@ def test_recover_stuck_approving_defaults_to_ten_minutes():
     actions.recover_stuck_approving(conn)
     sql, params = conn.queries[0]
     assert params == (actions.DEFAULT_STUCK_APPROVING_RECOVERY_MINUTES,)
+
+
+def test_a_network_failure_while_removing_labels_is_still_reported_as_outcome_unknown():
+    row = _pending_row(tool_name="propose_remove_labels", arguments={"labels": ["bug"]})
+    conn = FakeConn(pending_action_row=row)
+    read_client = _read_client(snapshot={"state": "open", "labels": ["bug"], "assignees": []})
+    write_client = MagicMock()
+    write_client.remove_label.side_effect = requests.exceptions.ConnectionError("reset")
+
+    result = actions.approve_action(conn, read_client, write_client, "action-1", "alice")
+
+    assert result["status"] == "failed"
+    assert result["outcome_unknown"] is True
+
+
+def test_list_pending_actions_is_paginated():
+    conn = FakeConn()
+
+    actions.list_pending_actions(conn, limit=10, offset=20)
+
+    query, params = conn.queries[-1]
+    assert "LIMIT %s OFFSET %s" in query
+    assert params == (10, 20)
+
+
+def test_claim_compares_the_row_age_against_the_database_clock():
+    row = _pending_row(created_at=datetime.now(timezone.utc) - timedelta(hours=49))
+    row["db_now"] = row["created_at"] + timedelta(hours=1)
+    conn = FakeConn(pending_action_row=row)
+    write_client = MagicMock()
+
+    result = actions.approve_action(conn, _read_client(), write_client, "action-1", "alice")
+
+    assert result["status"] == "executed"

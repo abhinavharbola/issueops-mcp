@@ -1,4 +1,5 @@
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -7,8 +8,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from issueops.config import load_config
 from issueops.db import sync_connection
 
+_REPO_NAME = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
 
 def add_repo(dsn: str, repo: str):
+    if not _REPO_NAME.match(repo):
+        raise ValueError(f"repo must look like owner/name, got: {repo!r}")
     with sync_connection(dsn) as conn:
         conn.execute(
             """

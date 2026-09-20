@@ -133,3 +133,61 @@ def test_paginated_get_rejects_an_unexpected_response_shape():
 
     with pytest.raises(GitHubAPIError):
         client._paginated_get("/repos/owner/repo/labels", {})
+
+
+def test_get_issue_without_comments_makes_a_single_request():
+    client = GitHubReadClient("fake-pat")
+    client._session.request = MagicMock(return_value=_mock_response(200, json_data={"number": 1}))
+
+    issue = client.get_issue("owner/repo", 1, include_comments=False)
+
+    assert "comments_detail" not in issue
+    assert client._session.request.call_count == 1
+
+
+def test_search_issues_drops_results_from_other_repositories():
+    client = GitHubReadClient("fake-pat")
+    payload = {
+        "total_count": 3,
+        "items": [
+            {"number": 1, "repository_url": "https://api.github.com/repos/owner/repo"},
+            {"number": 2, "repository_url": "https://api.github.com/repos/other/private"},
+            {"number": 3, "repository_url": "https://api.github.com/repos/Owner/Repo"},
+        ],
+    }
+    client._session.request = MagicMock(return_value=_mock_response(200, json_data=payload))
+
+    result = client.search_issues("owner/repo", "is:open")
+
+    assert [i["number"] for i in result["items"]] == [1, 3]
+    assert result["filtered_out_other_repos"] == 1
+    assert client._session.request.call_args.kwargs["params"]["q"] == "repo:owner/repo is:open"
+
+
+def test_search_issues_does_not_annotate_when_nothing_was_filtered():
+    client = GitHubReadClient("fake-pat")
+    payload = {"total_count": 1, "items": [{"number": 1, "repository_url": "https://api.github.com/repos/owner/repo"}]}
+    client._session.request = MagicMock(return_value=_mock_response(200, json_data=payload))
+
+    result = client.search_issues("owner/repo", "bug")
+
+    assert "filtered_out_other_repos" not in result
+
+
+def test_get_repo_assignees_uses_the_assignees_endpoint():
+    client = GitHubReadClient("fake-pat")
+    client._session.request = MagicMock(return_value=_mock_response(200, json_data=[{"login": "octocat"}]))
+
+    result = client.get_repo_assignees("owner/repo")
+
+    assert result == [{"login": "octocat"}]
+    assert client._session.request.call_args.args[1].endswith("/repos/owner/repo/assignees")
+
+
+def test_list_issues_passes_max_pages_to_the_pagination_guard():
+    client = GitHubReadClient("fake-pat")
+    first = _mock_response(200, json_data=[{"number": 1}], headers={"Link": '<https://api.github.com/repos/o/r/issues?page=2>; rel="next"'})
+    client._session.request = MagicMock(return_value=first)
+
+    with pytest.raises(PaginationLimitExceededError):
+        client.list_issues("o/r", max_pages=1)

@@ -1,18 +1,18 @@
 CREATE TABLE repo_allowlist (
     repo TEXT PRIMARY KEY,
     active BOOLEAN NOT NULL DEFAULT true,
-    added_at TIMESTAMPTZ DEFAULT now()
+    added_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE TABLE pending_actions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    created_at TIMESTAMPTZ DEFAULT now(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     tool_name TEXT NOT NULL,
     repo TEXT NOT NULL REFERENCES repo_allowlist(repo),
     issue_number INT NOT NULL,
     arguments JSONB NOT NULL,
     issue_state_snapshot JSONB NOT NULL,
-    heuristic_flagged BOOLEAN DEFAULT false,
+    heuristic_flagged BOOLEAN NOT NULL DEFAULT false,
     requested_by TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending'
         CHECK (status IN ('pending', 'approving', 'rejected', 'expired', 'stale', 'blocked', 'executed', 'failed')),
@@ -25,7 +25,7 @@ CREATE TABLE pending_actions (
 
 CREATE TABLE audit_log (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    timestamp TIMESTAMPTZ DEFAULT now(),
+    timestamp TIMESTAMPTZ NOT NULL DEFAULT now(),
     tool_name TEXT NOT NULL,
     repo TEXT,
     issue_number INT,
@@ -40,5 +40,6 @@ CREATE TABLE audit_log (
 
 CREATE INDEX idx_pending_actions_dedup ON pending_actions (repo, issue_number, tool_name, status);
 CREATE INDEX idx_pending_actions_status_created ON pending_actions (status, created_at DESC);
+CREATE INDEX idx_pending_actions_requested_by ON pending_actions (requested_by, status);
 CREATE INDEX idx_pending_actions_approving ON pending_actions (claimed_at) WHERE status = 'approving';
 CREATE INDEX idx_audit_log_timestamp ON audit_log (timestamp DESC);

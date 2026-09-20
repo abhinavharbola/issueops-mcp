@@ -12,10 +12,14 @@ class FakeCursor:
         self.conn = conn
 
     def fetchone(self):
-        if "SELECT * FROM pending_actions WHERE id" in self.sql and "FOR UPDATE" in self.sql:
+        if "FROM pending_actions WHERE id" in self.sql and "FOR UPDATE" in self.sql:
             if self.conn.pending_action_row is not None and self.params:
                 self.conn.claimed_action_id = self.params[0]
             return self.conn.pending_action_row
+        if "SELECT count(*) AS n FROM pending_actions" in self.sql:
+            if "issue_number = %s" in self.sql:
+                return {"n": self.conn.pending_per_issue}
+            return {"n": self.conn.pending_per_initiator}
         if "SELECT active FROM repo_allowlist" in self.sql:
             return {"active": self.conn.repo_active}
         if "RETURNING claimed_at" in self.sql:
@@ -31,6 +35,8 @@ class FakeCursor:
         return None
 
     def fetchall(self):
+        if "SELECT DISTINCT issue_number FROM pending_actions" in self.sql:
+            return [{"issue_number": n} for n in self.conn.handled_issue_numbers]
         if "SELECT id, arguments FROM pending_actions" in self.sql:
             if self.conn.existing_pending:
                 existing_id, existing_arguments = self.conn.existing_pending
@@ -51,6 +57,9 @@ class FakeConn:
         stuck_approving_rows=None,
         lease_held=True,
         lease_token="lease-token-1",
+        pending_per_issue=0,
+        pending_per_initiator=0,
+        handled_issue_numbers=(),
     ):
         self.repo_active = repo_active
         self.existing_pending = existing_pending
@@ -59,15 +68,24 @@ class FakeConn:
         self.stuck_approving_rows = stuck_approving_rows or []
         self.lease_held = lease_held
         self.lease_token = lease_token
+        self.pending_per_issue = pending_per_issue
+        self.pending_per_initiator = pending_per_initiator
+        self.handled_issue_numbers = list(handled_issue_numbers)
         self.claimed_action_id = None
+        self.in_transaction = False
         self.queries = []
 
     def execute(self, sql, params=None):
         self.queries.append((" ".join(sql.split()), params))
         return FakeCursor(sql, params, self)
 
+    @contextlib.contextmanager
     def transaction(self):
-        return contextlib.nullcontext()
+        self.in_transaction = True
+        try:
+            yield
+        finally:
+            self.in_transaction = False
 
 
 def sync_connection_returning(fake_conn):
