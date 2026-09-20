@@ -1,14 +1,12 @@
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
+
+import requests
 
 from issueops import tools
 from issueops.github_client import GitHubReadClient, GitHubWriteClient
 
 DEFAULT_PENDING_ACTION_TTL_HOURS = 48
 DEFAULT_STUCK_APPROVING_RECOVERY_MINUTES = 10
-
-
-def _now_minus(hours: int = 0, minutes: int = 0):
-    return datetime.now(timezone.utc) - timedelta(hours=hours, minutes=minutes)
 
 
 def expire_stale_pending(conn, ttl_hours: int = DEFAULT_PENDING_ACTION_TTL_HOURS):
@@ -41,9 +39,15 @@ def recover_stuck_approving(conn, minutes: int = DEFAULT_STUCK_APPROVING_RECOVER
     return rows
 
 
-def list_pending_actions(conn):
+def count_pending_actions(conn) -> int:
+    row = conn.execute("SELECT count(*) AS n FROM pending_actions WHERE status = 'pending'").fetchone()
+    return row["n"]
+
+
+def list_pending_actions(conn, limit: int = 25, offset: int = 0):
     return conn.execute(
-        "SELECT * FROM pending_actions WHERE status = 'pending' ORDER BY created_at DESC"
+        "SELECT * FROM pending_actions WHERE status = 'pending' ORDER BY created_at DESC, id LIMIT %s OFFSET %s",
+        (limit, offset),
     ).fetchall()
 
 
@@ -73,23 +77,43 @@ def _execute_on_github(write_client: GitHubWriteClient, tool_name: str, repo: st
                 raise RuntimeError(detail) from exc
         return removed
     if tool_name == "propose_assign":
-        return write_client.assign(repo, issue_number, arguments["assignee"])
+        assignee = arguments["assignee"]
+        result = write_client.assign(repo, issue_number, assignee)
+        applied = {a.get("login", "").lower() for a in (result or {}).get("assignees", [])}
+        if assignee.lower() not in applied:
+            raise RuntimeError(f"GitHub accepted the request but {assignee!r} is not an assignee of the issue")
+        return result
     if tool_name == "propose_close":
         return write_client.close(repo, issue_number, arguments.get("reason"))
     raise ValueError(f"unknown mutating tool: {tool_name}")
 
 
+def _stale_reason(tool_name: str, arguments: dict, then: dict, now: dict) -> str | None:
+    then_hash = then.get("content_hash")
+    if then_hash is not None and then_hash != now.get("content_hash"):
+        return "issue title or body changed since the proposal"
+    if tool_name == "propose_close" and now.get("state") != "open":
+        return "issue is no longer open"
+    if tool_name == "propose_remove_labels":
+        present = set(now.get("labels", []))
+        missing = [label for label in arguments["labels"] if label not in present]
+        if missing:
+            return f"labels are no longer on the issue: {missing}"
+    return None
+
+
 def _claim_pending_action(conn, action_id: str, approver: str, ttl_hours: int):
     with conn.transaction():
         row = conn.execute(
-            "SELECT * FROM pending_actions WHERE id = %s AND status = 'pending' FOR UPDATE", (action_id,)
+            "SELECT *, now() AS db_now FROM pending_actions WHERE id = %s AND status = 'pending' FOR UPDATE",
+            (action_id,),
         ).fetchone()
         if row is None:
             return None, None, {"status": "not_found_or_not_pending"}
 
         tool_name, repo, issue_number, arguments = row["tool_name"], row["repo"], row["issue_number"], row["arguments"]
 
-        if row["created_at"] < _now_minus(hours=ttl_hours):
+        if row["created_at"] < row["db_now"] - timedelta(hours=ttl_hours):
             conn.execute("UPDATE pending_actions SET status = 'expired' WHERE id = %s", (action_id,))
             tools.write_audit_log(conn, tool_name, repo, issue_number, arguments, action_id, approver, "expired", "expired between page load and approve click", 0)
             return None, None, {"status": "expired"}
@@ -126,7 +150,7 @@ def _finish_with_lease(conn, action_id: str, lease: object, set_sql: str, set_pa
 def _finish_before_github_call(conn, tool_name, repo, issue_number, arguments, action_id, approver, lease, set_sql, set_params, status, summary):
     if _finish_with_lease(conn, action_id, lease, set_sql, set_params):
         tools.write_audit_log(conn, tool_name, repo, issue_number, arguments, action_id, approver, status, summary, 0)
-        return {"status": status, **({"error": summary} if status == "failed" else {})}
+        return {"status": status, **({"error": summary} if status in ("failed", "stale") else {})}
 
     tools.write_audit_log(
         conn, tool_name, repo, issue_number, arguments, action_id, approver, "lost_lease",
@@ -147,6 +171,9 @@ def approve_action(
 
     try:
         current_snapshot = tools.snapshot_issue_state(read_client, repo, issue_number)
+        existing_comments = (
+            read_client.get_issue_comments(repo, issue_number) if tool_name == "propose_add_comment" else []
+        )
     except Exception as exc:
         return _finish_before_github_call(
             conn, tool_name, repo, issue_number, arguments, action_id, approver, lease,
@@ -160,25 +187,39 @@ def approve_action(
         )
         return {"status": "lost_lease"}
 
-    if current_snapshot != row["issue_state_snapshot"]:
+    stale_reason = _stale_reason(tool_name, arguments, row["issue_state_snapshot"], current_snapshot)
+    if stale_reason is None and tool_name == "propose_add_comment":
+        wanted = arguments["body"].strip()
+        if any((comment.get("body") or "").strip() == wanted for comment in existing_comments):
+            stale_reason = "an identical comment already exists on the issue"
+    if stale_reason is not None:
         return _finish_before_github_call(
             conn, tool_name, repo, issue_number, arguments, action_id, approver, lease,
-            "SET status = 'stale'", (), "stale", "issue state diverged from snapshot",
+            "SET status = 'stale', failure_reason = %s", (stale_reason,), "stale", stale_reason,
         )
 
     try:
         _execute_on_github(write_client, tool_name, repo, issue_number, arguments)
     except Exception as exc:
-        if _finish_with_lease(conn, action_id, lease, "SET status = 'failed', failure_reason = %s", (str(exc),)):
-            tools.write_audit_log(conn, tool_name, repo, issue_number, arguments, action_id, approver, "failed", str(exc), 0)
-            return {"status": "failed", "error": str(exc)}
+        outcome_unknown = isinstance(exc.__cause__ or exc, requests.exceptions.RequestException)
+        message = (
+            f"outcome unknown, the request may have been applied before the connection failed: {exc}"
+            if outcome_unknown
+            else str(exc)
+        )
+        if _finish_with_lease(conn, action_id, lease, "SET status = 'failed', failure_reason = %s", (message,)):
+            tools.write_audit_log(conn, tool_name, repo, issue_number, arguments, action_id, approver, "failed", message, 0)
+            result = {"status": "failed", "error": message}
+            if outcome_unknown:
+                result["outcome_unknown"] = True
+            return result
 
         tools.write_audit_log(
             conn, tool_name, repo, issue_number, arguments, action_id, approver, "lost_lease_after_execution",
-            f"the GitHub call raised ({exc}) but the lease was lost before this could be recorded; "
+            f"the GitHub call raised ({message}) but the lease was lost before this could be recorded; "
             "check GitHub and the audit log for a possible duplicate or partial action", 0,
         )
-        return {"status": "lost_lease_after_execution", "error": str(exc)}
+        return {"status": "lost_lease_after_execution", "error": message}
 
     updated = _finish_with_lease(
         conn, action_id, lease,

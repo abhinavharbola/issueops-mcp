@@ -95,29 +95,48 @@ class _BaseClient:
 
 
 class GitHubReadClient(_BaseClient):
-    def list_issues(self, repo: str, state: str = "open", labels: list[str] | None = None, since: str | None = None):
+    def list_issues(
+        self, repo: str, state: str = "open", labels: list[str] | None = None,
+        since: str | None = None, max_pages: int = 20,
+    ):
         params = {"state": state}
         if labels:
             params["labels"] = ",".join(labels)
         if since:
             params["since"] = since
-        return self._paginated_get(f"/repos/{repo}/issues", params)
+        return self._paginated_get(f"/repos/{repo}/issues", params, max_pages=max_pages)
 
-    def get_issue(self, repo: str, issue_number: int):
+    def get_issue(self, repo: str, issue_number: int, include_comments: bool = True):
         issue = self._request("GET", f"/repos/{repo}/issues/{issue_number}")
-        comments = self._paginated_get(f"/repos/{repo}/issues/{issue_number}/comments", {})
-        issue["comments_detail"] = comments
+        if include_comments:
+            issue["comments_detail"] = self.get_issue_comments(repo, issue_number)
         return issue
+
+    def get_issue_comments(self, repo: str, issue_number: int):
+        return self._paginated_get(f"/repos/{repo}/issues/{issue_number}/comments", {})
+
+    def list_repo_comments(self, repo: str, since: str):
+        return self._paginated_get(f"/repos/{repo}/issues/comments", {"since": since})
 
     def list_pull_requests(self, repo: str, state: str = "open"):
         return self._paginated_get(f"/repos/{repo}/pulls", {"state": state})
 
     def search_issues(self, repo: str, query: str):
         full_query = f"repo:{repo} {query}"
-        return self._request("GET", "/search/issues", params={"q": full_query, "per_page": 100})
+        data = self._request("GET", "/search/issues", params={"q": full_query, "per_page": 100})
+        suffix = f"/repos/{repo}".lower()
+        items = data.get("items", [])
+        kept = [item for item in items if str(item.get("repository_url", "")).lower().endswith(suffix)]
+        result = {**data, "items": kept}
+        if len(kept) != len(items):
+            result["filtered_out_other_repos"] = len(items) - len(kept)
+        return result
 
     def get_repo_labels(self, repo: str):
         return self._paginated_get(f"/repos/{repo}/labels", {})
+
+    def get_repo_assignees(self, repo: str):
+        return self._paginated_get(f"/repos/{repo}/assignees", {})
 
 
 class GitHubWriteClient(_BaseClient):
