@@ -130,13 +130,10 @@ def _parse_classification(raw_text: str) -> dict:
     return _sanitize_classification(_extract_json(raw_text))
 
 
-def build_groq_clients(config: Config) -> list[Groq]:
+def build_groq_client(config: Config) -> Groq:
     if not config.groq_api_key:
-        raise RuntimeError("GROQ_API_KEY is required to build Groq clients")
-    clients = [Groq(api_key=config.groq_api_key)]
-    if config.groq_api_key_fallback:
-        clients.append(Groq(api_key=config.groq_api_key_fallback))
-    return clients
+        raise RuntimeError("GROQ_API_KEY is required to build a Groq client")
+    return Groq(api_key=config.groq_api_key)
 
 
 def _json_mode_rejected(exc: Exception) -> bool:
@@ -155,41 +152,27 @@ def _complete_once(client: Groq, model: str, messages: list[dict]):
         return client.chat.completions.create(model=model, messages=messages, temperature=0)
 
 
-def _create_completion(groq_clients: list[Groq], model: str, messages: list[dict]):
-    last_exc = None
-    for client in groq_clients:
-        try:
-            return _complete_once(client, model, messages)
-        except RateLimitError as exc:
-            last_exc = exc
-            continue
-
-    retry_after = 1.0
-    if last_exc is not None:
-        header_value = last_exc.response.headers.get("retry-after")
+def _create_completion(client: Groq, model: str, messages: list[dict]):
+    try:
+        return _complete_once(client, model, messages)
+    except RateLimitError as exc:
+        retry_after = 1.0
+        header_value = exc.response.headers.get("retry-after")
         if header_value:
             try:
                 retry_after = float(header_value)
             except ValueError:
                 pass
-    time.sleep(min(retry_after, MAX_RETRY_AFTER_SECONDS))
-
-    for client in groq_clients:
-        try:
-            return _complete_once(client, model, messages)
-        except RateLimitError as exc:
-            last_exc = exc
-            continue
-
-    raise last_exc
+        time.sleep(min(retry_after, MAX_RETRY_AFTER_SECONDS))
+        return _complete_once(client, model, messages)
 
 
 def classify_issue(
-    groq_clients: list[Groq], model: str, issue: dict,
+    groq_client: Groq, model: str, issue: dict,
     repo_labels: list[str] | None = None, assignable: list[str] | None = None,
 ) -> dict:
     response = _create_completion(
-        groq_clients,
+        groq_client,
         model,
         [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -284,7 +267,7 @@ def run_triage(
     config = load_config(require_write_pat=False, require_groq=True)
     configure_logfire(config.logfire_token, service_name="issueops-triage-agent")
     read_client = GitHubReadClient(config.github_read_pat)
-    groq_clients = build_groq_clients(config)
+    groq_client = build_groq_client(config)
 
     dsn = config.neon_dsn
     already_called = set()
@@ -329,7 +312,7 @@ def run_triage(
                 raise ValueError("issue summary is missing a 'number' field")
             issue = tools.get_issue(dsn, read_client, repo, issue_number, initiator)
             flagged = is_heuristically_flagged(tools.issue_plaintext(issue))
-            classification = classify_issue(groq_clients, model, issue, repo_labels, assignable)
+            classification = classify_issue(groq_client, model, issue, repo_labels, assignable)
             plan = _plan_from_classification(
                 classification, repo, issue_number, issue, repo_labels, assignable,
                 allow_comment=allow_comment and not flagged, allow_close=allow_close and not flagged,
@@ -456,3 +439,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+

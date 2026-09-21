@@ -46,7 +46,7 @@ Design notes for each step (lease-based claiming, the stale check, crash recover
 
 ## Processes and credentials
 
-Each process is started separately and loads only the credentials it needs.
+Each process is started separately and loads only the credentials it needs, from a single `.env` file.
 
 | Process | Entry point | Credentials | Writes to GitHub |
 |---|---|---|---|
@@ -54,7 +54,7 @@ Each process is started separately and loads only the credentials it needs.
 | Triage agent | `python -m agent.triage` | read token, Groq key | No |
 | Dashboard | `streamlit run dashboard/app.py` | read token, write token | Yes, only after a human approves |
 
-`load_config(require_write_pat=False)` never reads the write token from the env file, drops it if it was inherited from the environment, and makes a later write-mode load in the same process raise. The Groq key is only required by the triage agent and the eval, so the dashboard does not hold an LLM key. For real separation, give each process its own env file via `ISSUEOPS_ENV_FILE`. Details and limits of this approach are in [`docs/architecture.md`](docs/architecture.md#credential-separation).
+`load_config(require_write_pat=False)` never reads the write token from the env file, drops it if it was inherited from the environment, and makes a later write-mode load in the same process raise. The Groq key is only required by the triage agent and the eval, so the dashboard does not hold an LLM key. So even with one shared `.env`, the MCP server and triage agent processes never hold `GITHUB_WRITE_PAT` in memory, only the dashboard does. Details and limits of this approach are in [`docs/architecture.md`](docs/architecture.md#credential-separation).
 
 ## MCP tools
 
@@ -73,7 +73,7 @@ Each process is started separately and loads only the credentials it needs.
 
 ## Triage agent
 
-- **Model:** `openai/gpt-oss-20b` on Groq by default (`--model` to change). One call per issue, JSON mode requested with one fallback call if the model rejects it, and a second key (`GROQ_API_KEY_FALLBACK`) tried on rate limits.
+- **Model:** `openai/gpt-oss-20b` on Groq by default (`--model` to change). One call per issue, JSON mode requested with one fallback call if the model rejects it, and rate-limit responses are retried once after the `retry-after` delay before the call is given up on.
 - **Trusted context:** the classifier is told the issue's state, current labels and assignees, the labels that exist on the repo, and who can be assigned. Untrusted issue text is passed separately, inside delimiters.
 - **Allowed proposals:** by default the agent only proposes labels and assignments. Free-text comments need `--allow-comment` and closes need `--allow-close`, because a comment body is the natural payload for a prompt-injected issue. Even with the flags on, an issue that trips the injection phrase check gets labels and assignments only.
 - **Plan filtering:** proposals for labels already on the issue, labels not on the repo, assignees who are already assigned or not assignable, and closes on issues that are not open are dropped before anything is queued.
@@ -101,11 +101,9 @@ Each process is started separately and loads only the credentials it needs.
 - **Label recreation guard:** GitHub creates a label that does not exist when it is added to an issue. Approving an add-labels proposal re-reads the repo's labels and marks the action stale if any of them has been deleted since.
 - **Crash recovery:** rows stuck in `approving` longer than `STUCK_APPROVING_RECOVERY_MINUTES` are recovered according to whether the GitHub call had begun. The approval writes `execution_started_at` under its lease immediately before the call, and refuses to call GitHub if that write fails. A stuck row without the marker never reached GitHub and returns to `pending`. A stuck row with the marker may have been applied, so it moves to `needs_review` instead. The dashboard lists those rows and a person checks GitHub, then records either that it was applied (the row becomes `executed`) or that it was not (the row returns to `pending`). Both resolutions write an audit row naming the person. Nothing with an unknown outcome is ever offered for approval again automatically.
 - **Proposal expiry:** unapproved proposals expire after `PENDING_ACTION_TTL_HOURS` (48), with an audit entry per expired row.
-- **Dashboard access:** the dashboard refuses to start unless `DASHBOARD_ACCESS_TOKEN` is set. Running without one needs an explicit `DASHBOARD_ALLOW_INSECURE=true`, meant for a machine only you can reach. Failed attempts are throttled per session (5 per minute), so another visitor cannot lock you out. Failures across all sessions only add a delay to further failed attempts and never block a correct token.
+- **Dashboard access:** the dashboard refuses to start unless `DASHBOARD_ACCESS_TOKEN` is set. Running without one needs an explicit `DASHBOARD_ALLOW_INSECURE=true`, meant for a machine only you can reach.
 - **Review panel:** each pending action shows the model's rationale and the issue text stored with the proposal. The stored limits (300 characters of title, 8000 of body, the last 10 comments at 1500 characters each) come from the same constants as the classifier prompt, so for agent proposals the panel contains everything the model read. Proposals from MCP clients may have been based on more text, and the panel says so. If anything was cut it says that too, and if an injection phrase sits in text that was not stored it shows a separate error telling the approver to load the live issue. Matched injection phrases are listed, and a flagged proposal cannot be approved until the approver ticks an acknowledgement. The optional live view loads the current issue with comments.
 - **Repo names:** the allowlist stores lower-case `owner/name` values and the database rejects `.` and `..` segments.
-
-- **Database roles:** `db/roles.sql` creates three group roles. `issueops_proposer` (MCP server and triage agent) can only read the allowlist, insert and read proposals, upsert triage attempts, and insert audit rows. `issueops_approver` (dashboard) can read and update proposals, and read and insert audit rows. `issueops_pruner` (the prune script) can additionally delete audit rows. A trigger makes `audit_log` reject every UPDATE and TRUNCATE, and every DELETE except by members of `issueops_pruner` and superusers. Insert triggers additionally stop a proposer login from inserting anything except a plain `pending` proposal (no approval, claim, execution, or rejection fields), and from writing audit rows with any result other than `ok`, `error`, `proposed`, or `deduped`; both triggers stamp the timestamp from the database clock. A compromised MCP process can therefore no longer rewrite history, flip a proposal to `executed`, or forge an approved and executed record together with a matching audit row. Superusers and the owner are exempt. Re-run `db/roles.sql` after upgrading, since it is idempotent. The table owner can still drop the trigger, so keep the owner credential out of every running process.
 - **Secrets in memory:** `Config` excludes every credential from its `repr`, so logging the config object or a traceback that includes it cannot leak a token.
 
 ## Safety
@@ -116,43 +114,42 @@ Issue titles, bodies, and comments come from the open internet and are treated a
 ```
 issueops-mcp/
 ├── issueops/
-│   ├── config.py              # env loading, per-role credential rules
-│   ├── db.py                  # Postgres connection helper
-│   ├── limits.py              # text limits shared by the classifier prompt and the review excerpt
-│   ├── github_client.py       # read and write GitHub clients, pagination guard
-│   ├── tools.py               # read tools, propose tools, validation, caps, audit writes
-│   ├── actions.py             # approve, reject, expire, recover, lease handling
-│   ├── heuristics.py          # advisory injection-phrase check
-│   ├── projection.py          # slims and bounds what the MCP read tools return
-│   └── observability.py       # optional Logfire setup
+│   ├── config.py               # env loading, credential rules
+│   ├── db.py                   # Postgres connection helper
+│   ├── limits.py                # text limits shared by the classifier prompt and the review excerpt
+│   ├── github_client.py        # read and write GitHub clients, pagination guard
+│   ├── tools.py                # read tools, propose tools, validation, caps, audit writes
+│   ├── actions.py              # approve, reject, expire, recover, lease handling
+│   ├── heuristics.py           # advisory injection-phrase check
+│   ├── projection.py           # slims and bounds what the MCP read tools return
+│   └── observability.py        # optional Logfire setup
 │
 ├── agent/
-│   ├── prompts.py             # classifier prompt, trusted context, untrusted block
-│   ├── triage.py              # scheduled triage agent and CLI
+│   ├── prompts.py               # classifier prompt, trusted context, untrusted block
+│   ├── triage.py                # scheduled triage agent and CLI
 │   └── heuristics.py
 │
-├── mcp_server/server.py       # MCP server exposing the 10 tools
+├── mcp_server/server.py        # MCP server exposing the 10 tools
 ├── dashboard/
-│   ├── app.py                 # Streamlit approval UI and audit log view
-│   └── auth.py                # access token check and per-session throttle
+│   ├── app.py                   # Streamlit approval UI and audit log view
+│   └── auth.py                  # access token check
 │
 ├── db/
-│   ├── schema.sql             # idempotent: creates a fresh database or upgrades an existing one
-│   ├── roles.sql              # least-privilege roles and the append-only audit log trigger
-│   └── migrations/            # the same changes as separate steps
+│   ├── schema.sql               # idempotent: creates a fresh database or upgrades an existing one
+│   └── migrations/             # the same changes as separate steps
 │
 ├── eval/
-│   ├── eval.py                # classification, adversarial, and audit-consistency checks
-│   └── labels_template.json   # fixture format
+│   ├── eval.py                  # classification, adversarial, and audit-consistency checks
+│   └── labels_template.json     # fixture format
 │
 ├── scripts/
-│   ├── allowlist.py           # add, deactivate, list allowlisted repos
-│   ├── prune_audit_log.py     # delete audit rows older than N days
-│   └── custom_client.py       # call one MCP tool from the command line
+│   ├── allowlist.py             # add, deactivate, list allowlisted repos
+│   ├── prune_audit_log.py       # delete audit rows older than N days
+│   └── custom_client.py         # call one MCP tool from the command line
 │
-├── tests/                     # unit tests plus Postgres integration tests
+├── tests/                      # unit tests plus Postgres integration tests
 ├── docs/architecture.md
-├── conftest.py                # fake DB used by the unit tests
+├── conftest.py                 # fake DB used by the unit tests
 ├── .github/workflows/ci.yml
 ├── .env.example
 ├── requirements.txt
@@ -161,7 +158,7 @@ issueops-mcp/
 
 ## Getting started
 
-1. **Accounts and keys**, you'll need:
+1. **API keys and accounts**, you'll need:
    - GitHub, two fine-grained tokens on the target repo: a read token (Issues read, Pull requests read, Metadata read) and a write token (Issues read and write). Create them at https://github.com/settings/personal-access-tokens
    - Neon (free tier): https://neon.tech. Copy the pooled connection string.
    - Groq, for the triage agent and the eval: https://console.groq.com/keys
@@ -171,53 +168,27 @@ issueops-mcp/
    ```
    python3 -m venv .venv && source .venv/bin/activate
    pip install -r requirements.txt
+   cp .env.example .env   # fill in every key you have; leave the rest blank
    ```
 
-3. **Database**, no local `psql` needed. Open your Neon project's **SQL Editor**, paste in [`db/schema.sql`](db/schema.sql), and run it. The script is idempotent, so the same file creates a fresh database and upgrades an existing one (it adds missing columns and statuses, lower-cases stored repo names, and re-creates the constraints). It is safe to run again after pulling new versions. `db/migrations/` holds the same changes as separate steps for anyone who prefers to apply them by hand.
+3. **Database**, no local `psql` needed. Open your Neon project's **SQL Editor**, paste in [`db/schema.sql`](db/schema.sql), and run it. The script is idempotent, so the same file creates a fresh database and upgrades an existing one. It is safe to run again after pulling new versions.
 
-4. **Database roles (recommended).** Run [`db/roles.sql`](db/roles.sql) the same way with the owner credential, and run it again after upgrading (it is idempotent). It creates the group roles `issueops_proposer`, `issueops_approver` and `issueops_pruner`, grants each only what its process needs, makes `audit_log` append-only, and stops proposer logins from inserting approved or executed records. Then create one login role per process, each with its own password:
+4. **Allowlist a repo.** Nothing works on a repo until this is done.
    ```
-   CREATE ROLE issueops_mcp LOGIN PASSWORD '...' IN ROLE issueops_proposer;
-   CREATE ROLE issueops_dashboard LOGIN PASSWORD '...' IN ROLE issueops_approver;
-   CREATE ROLE issueops_prune LOGIN PASSWORD '...' IN ROLE issueops_pruner;
-   ```
-   Use the owner credential only for `schema.sql`, `roles.sql`, and `scripts/allowlist.py`. Do not put it in any long-running process's env file.
-
-5. **Env files.** Keep the write token out of the read-only processes' file, and give each process its own database login.
-
-   `.env`, read by the MCP server and triage agent (`issueops_mcp` login):
-   ```
-   NEON_DSN=postgresql://issueops_mcp:...@...
-   GITHUB_READ_PAT=...
-   GROQ_API_KEY=...
-   ```
-   `.env.dashboard`, read by the dashboard only (`issueops_dashboard` login):
-   ```
-   NEON_DSN=postgresql://issueops_dashboard:...@...
-   GITHUB_READ_PAT=...
-   GITHUB_WRITE_PAT=...
-   DASHBOARD_ACCESS_TOKEN=a-long-random-string
-   ```
-   `.env.prune` (`issueops_prune` login) and `.env.admin` (owner login) each need only `NEON_DSN` and `GITHUB_READ_PAT`. The eval reads `pending_actions`, so run it with the dashboard's database login plus `GROQ_API_KEY` and no write token.
-
-   Run `chmod 600` on every env file. Confirm your `.gitignore` covers each of these names, since a plain `.env` entry does not match `.env.dashboard`. All other settings are optional, see the table below.
-
-6. **Allowlist a repo.** Nothing works on a repo until this is done.
-   ```
-   ISSUEOPS_ENV_FILE=.env.admin python scripts/allowlist.py add owner/repo
+   python scripts/allowlist.py add owner/repo
    ```
 
 ## Running it
 
-Run these from the repo root.
+Run these from the repo root, all reading the same `.env`:
 
 | Command | What it does |
 |---|---|
-| `ISSUEOPS_ENV_FILE=.env.dashboard streamlit run dashboard/app.py` | Approval dashboard |
+| `streamlit run dashboard/app.py` | Approval dashboard |
 | `python -m agent.triage owner/repo --max-issues 5` | Queue label and assignment proposals from the triage agent. Add `--allow-comment` and `--allow-close` to also let it propose comments and closes |
 | `python -m mcp_server.server` | MCP server over stdio |
 | `python scripts/custom_client.py list_issues '{"repo": "owner/repo"}'` | Smoke-test one MCP tool |
-| `ISSUEOPS_ENV_FILE=.env.prune python scripts/prune_audit_log.py --days 90` | Delete audit rows older than 90 days |
+| `python scripts/prune_audit_log.py --days 90` | Delete audit rows older than 90 days |
 
 To use the MCP server from Claude Desktop, add this to `claude_desktop_config.json` with absolute paths, then restart it:
 ```
@@ -242,7 +213,6 @@ In the dashboard, enter the access token and your name in the sidebar, expand a 
 | `GITHUB_READ_PAT` | required | Read token |
 | `GITHUB_WRITE_PAT` | dashboard only | Write token |
 | `GROQ_API_KEY` | triage agent and eval | LLM key |
-| `GROQ_API_KEY_FALLBACK` | none | Second key tried on rate limits |
 | `LOGFIRE_TOKEN` | none | Enables tracing |
 | `PENDING_ACTION_TTL_HOURS` | 48 | How long a proposal can wait |
 | `STUCK_APPROVING_RECOVERY_MINUTES` | 10 | When an `approving` row is treated as crashed |
@@ -252,13 +222,13 @@ In the dashboard, enter the access token and your name in the sidebar, expand a 
 | `MCP_CLIENT_LABEL` | none | Label recorded as the MCP initiator |
 | `DASHBOARD_ACCESS_TOKEN` | none | Gates the dashboard. Required unless `DASHBOARD_ALLOW_INSECURE` is set |
 | `DASHBOARD_ALLOW_INSECURE` | false | Lets the dashboard run without a token |
-| `ISSUEOPS_ENV_FILE` | auto-discovered `.env` | Env file for this process |
+| `ISSUEOPS_ENV_FILE` | auto-discovered `.env` | Env file for this process, if you want to point somewhere other than the default `.env` |
 
 ## Testing
 
 Run `pytest` from the repo root.
 
-Most tests use the fake database in `conftest.py` to check SQL call sequences, and mocks for the GitHub clients. Those cannot verify locking. `tests/test_integration_postgres.py` runs against a real Postgres and covers concurrent approvals, lease reclamation, concurrent dedup, queue caps under concurrent proposals, deadlock freedom, atomic audit writes, retry after a dropped connection, triage memory, the schema upgrade from a legacy database, and audit pruning. The integration tests also apply `db/roles.sql` and check what each role can and cannot do. `tests/test_dashboard.py` drives the dashboard headlessly, and its database-backed cases use the same variable. It is skipped unless `TEST_DATABASE_URL` points at a scratch database. Each test creates and drops its own schema, and CI runs them against a Postgres service container.
+Most tests use the fake database in `conftest.py` to check SQL call sequences, and mocks for the GitHub clients. Those cannot verify locking. `tests/test_integration_postgres.py` runs against a real Postgres and covers concurrent approvals, lease reclamation, concurrent dedup, queue caps under concurrent proposals, deadlock freedom, atomic audit writes, retry after a dropped connection, triage memory, and the schema upgrade from a legacy database. `tests/test_dashboard.py` drives the dashboard headlessly, and its database-backed cases use the same variable. Both are skipped unless `TEST_DATABASE_URL` points at a scratch database. Each test creates and drops its own schema, and CI runs them against a Postgres service container.
 
 ## Evaluation
 
@@ -277,13 +247,13 @@ No labeled dataset is shipped, only the template.
 ## Known limitations
 
 - The injection heuristic is advisory. An attacker only has to avoid the listed phrases.
-- Approver identity in the dashboard is a typed name, not authentication. The access token gates the app but does not tell approvers apart, and its throttle is a speed bump, not a defense.
+- Approver identity in the dashboard is a typed name, not authentication. The access token gates the app but does not tell approvers apart.
 - Recovery of a row stuck in `approving` runs on dashboard page loads, not in a background worker, and it is time-based rather than a liveness check. A row whose GitHub call had started moves to `needs_review`, and if the original call was only slow, its result is reported as `lost_lease_after_execution`. Either way a person must check GitHub and resolve it in the dashboard. A resolution is the resolver's word, recorded in the audit log, and is not verified against GitHub.
 - The stale check does not cover new comments or edits to existing comments. The approver sees the comments as they were at proposal time and can load the current ones. A `stale` or `failed` action is terminal, so the agent can re-propose it on a later run but a person cannot retry it. A GitHub read failure during approval is not terminal: the row is released back to `pending`.
 - `propose_remove_labels` calls GitHub once per label and can partially succeed. The failure message lists what was removed and what was not.
 - The label and assignee caches are process-local with a 5 minute TTL and are not shared across workers.
 - Very large repos can hit the pagination limit (20 pages, 2000 items by default). Listing calls over MCP stop at `limit` items (at most 100) and report `truncated`; narrow the query with `state`, `labels`, or `since` to reach older items. Triage, the activity summary, and comment reads return partial results flagged as truncated. When an issue has more than 2000 comments, only the first 2000 are read, so the duplicate-comment check on approval covers only those.
 - The MCP initiator string includes the process id, so the per-initiator queue cap is per process, not per person.
-- The least-privilege database roles are provided but optional. Without applying `db/roles.sql` and giving each process its own login, all processes share one role and the audit log is append-only by convention only. With it applied, the table owner and any superuser can still bypass the trigger.
+- All processes share one Postgres role, so the audit log is append-only by convention (the code never issues an UPDATE, TRUNCATE, or DELETE against it outside `prune_audit_log.py`) rather than by database-enforced permission. Nothing in this repo stops a process holding the connection string from writing to `audit_log` directly.
 - The MCP read tools return projected summaries, not raw GitHub JSON. Fields that are not projected (reactions, timeline URLs, full user objects, review data on pull requests) are not available to the client, and `get_issue` returns only the 30 newest comments, each clipped to 2500 characters.
 - No dependency lockfile or license file is included. Choosing a license is up to the repository owner.

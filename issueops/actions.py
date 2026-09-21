@@ -449,3 +449,5 @@ def resolve_needs_review(conn, action_id: str, resolver: str, applied: bool, not
             f"{resolver} confirmed on GitHub that the action was not applied and returned it to pending{detail}", 0,
         )
         return {"status": "requeued"}
+
+

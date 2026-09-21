@@ -113,3 +113,5 @@ def build_user_prompt(issue: dict, repo_labels: list[str] | None = None, assigna
         f"{build_context_block(issue, repo_labels, assignable)}\n\n"
         f"{build_untrusted_block(issue)}"
     )
+
+

@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from dashboard import auth
 from issueops import config as config_module
 
 streamlit_testing = pytest.importorskip("streamlit.testing.v1")
@@ -21,7 +22,6 @@ def _clean_environment(monkeypatch):
     monkeypatch.setenv("GITHUB_READ_PAT", "read")
     monkeypatch.setenv("GITHUB_WRITE_PAT", "write")
     monkeypatch.setattr(config_module, "_write_pat_dropped_in_process", False)
-    monkeypatch.setattr("dashboard.auth.DELAY_PER_RECENT_FAILURE_SECONDS", 0)
 
 
 def _run(monkeypatch, dsn="postgresql://unused/unused", **env):
@@ -47,29 +47,6 @@ def test_a_wrong_token_shows_an_error_and_no_actions(monkeypatch):
     assert not at.exception
     assert any("correct access token" in e.value for e in at.sidebar.error)
     assert len(at.button) == 0
-
-
-def test_a_session_is_locked_after_repeated_wrong_tokens_even_with_the_right_one(monkeypatch):
-    at = _run(monkeypatch, DASHBOARD_ACCESS_TOKEN="right")
-
-    for attempt in range(6):
-        at.sidebar.text_input(key="dashboard_token").set_value(f"wrong-{attempt}").run()
-    at.sidebar.text_input(key="dashboard_token").set_value("right").run()
-
-    assert any("Too many failed attempts" in e.value for e in at.sidebar.error)
-    assert len(at.button) == 0
-
-
-def test_another_session_is_not_locked_out_by_a_different_sessions_failures(monkeypatch):
-    attacker = _run(monkeypatch, DASHBOARD_ACCESS_TOKEN="right")
-    for attempt in range(8):
-        attacker.sidebar.text_input(key="dashboard_token").set_value(f"guess-{attempt}").run()
-
-    legitimate = streamlit_testing.AppTest.from_file(APP_PATH, default_timeout=30).run()
-    legitimate.sidebar.text_input(key="dashboard_token").set_value("right").run()
-
-    assert not any("Too many failed attempts" in e.value for e in legitimate.sidebar.error)
-    assert not any("correct access token" in e.value for e in legitimate.sidebar.error)
 
 
 needs_database = pytest.mark.skipif(not DATABASE_URL, reason="TEST_DATABASE_URL is not set")
@@ -221,3 +198,17 @@ def test_a_needs_review_row_is_listed_and_can_be_resolved(monkeypatch, dashboard
     with psycopg.connect(dashboard_dsn, autocommit=True) as conn:
         status = conn.execute("SELECT status FROM pending_actions WHERE id = %s", (action_id,)).fetchone()[0]
     assert status == "executed"
+
+
+def test_the_correct_token_matches():
+    assert auth.token_matches("s3cret", "s3cret") is True
+
+
+@pytest.mark.parametrize("entered", ["", None, "wrong", "s3cret ", "S3CRET"])
+def test_wrong_or_empty_tokens_do_not_match(entered):
+    assert auth.token_matches(entered, "s3cret") is False
+
+
+def test_nothing_matches_when_no_token_is_configured():
+    assert auth.token_matches("anything", None) is False
+    assert auth.token_matches("", "") is False

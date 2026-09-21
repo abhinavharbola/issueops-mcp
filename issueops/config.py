@@ -12,7 +12,6 @@ class Config:
     github_read_pat: str = field(repr=False)
     github_write_pat: str | None = field(repr=False)
     groq_api_key: str | None = field(repr=False)
-    groq_api_key_fallback: str | None = field(repr=False)
     logfire_token: str | None = field(repr=False)
     pending_action_ttl_hours: int = 48
     stuck_approving_recovery_minutes: int = 10
@@ -84,7 +83,6 @@ def load_config(require_write_pat: bool = False, require_groq: bool = False) -> 
         github_read_pat=required("GITHUB_READ_PAT"),
         github_write_pat=write_pat,
         groq_api_key=groq_api_key,
-        groq_api_key_fallback=os.environ.get("GROQ_API_KEY_FALLBACK") or None,
         logfire_token=os.environ.get("LOGFIRE_TOKEN") or None,
         pending_action_ttl_hours=optional_int("PENDING_ACTION_TTL_HOURS", 48),
         stuck_approving_recovery_minutes=optional_int("STUCK_APPROVING_RECOVERY_MINUTES", 10),
@@ -93,3 +91,5 @@ def load_config(require_write_pat: bool = False, require_groq: bool = False) -> 
         dashboard_access_token=os.environ.get("DASHBOARD_ACCESS_TOKEN") or None,
         dashboard_allow_insecure=os.environ.get("DASHBOARD_ALLOW_INSECURE", "").strip().lower() in ("1", "true", "yes"),
     )
+
+

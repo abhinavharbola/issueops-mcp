@@ -9,7 +9,6 @@ REQUIRED_VARS = [
     "GITHUB_READ_PAT",
     "GITHUB_WRITE_PAT",
     "GROQ_API_KEY",
-    "GROQ_API_KEY_FALLBACK",
     "LOGFIRE_TOKEN",
     "PENDING_ACTION_TTL_HOURS",
     "STUCK_APPROVING_RECOVERY_MINUTES",
@@ -260,7 +259,6 @@ def test_repr_never_contains_a_secret(monkeypatch):
         "GITHUB_READ_PAT": "read-secret",
         "GITHUB_WRITE_PAT": "write-secret",
         "GROQ_API_KEY": "groq-secret",
-        "GROQ_API_KEY_FALLBACK": "groq-fallback-secret",
         "LOGFIRE_TOKEN": "logfire-secret",
         "DASHBOARD_ACCESS_TOKEN": "dashboard-secret",
     }
@@ -273,3 +271,5 @@ def test_repr_never_contains_a_secret(monkeypatch):
     rendered = repr(loaded) + str(loaded)
     for value in secrets.values():
         assert value not in rendered
+
+

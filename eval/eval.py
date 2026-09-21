@@ -3,7 +3,7 @@ import json
 import statistics
 import time
 
-from agent.triage import DEFAULT_MODEL, _plan_from_classification, build_groq_clients, classify_issue
+from agent.triage import DEFAULT_MODEL, _plan_from_classification, build_groq_client, classify_issue
 from issueops import tools
 from issueops.config import load_config
 from issueops.db import sync_connection
@@ -26,7 +26,7 @@ def load_labels(path: str) -> list[dict]:
 def run_classification_eval(labels_path: str, model: str = DEFAULT_MODEL, initiator: str = "eval"):
     config = load_config(require_write_pat=False, require_groq=True)
     read_client = GitHubReadClient(config.github_read_pat)
-    groq_clients = build_groq_clients(config)
+    groq_client = build_groq_client(config)
     labels = load_labels(labels_path)
     label_names_by_repo = {}
 
@@ -42,7 +42,7 @@ def run_classification_eval(labels_path: str, model: str = DEFAULT_MODEL, initia
 
         start = time.perf_counter()
         issue = tools.get_issue(config.neon_dsn, read_client, repo, entry["issue_number"], initiator)
-        classification = classify_issue(groq_clients, model, issue, repo_labels, None)
+        classification = classify_issue(groq_client, model, issue, repo_labels, None)
         latencies_ms.append((time.perf_counter() - start) * 1000)
 
         if entry["adversarial"]:
@@ -150,3 +150,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+

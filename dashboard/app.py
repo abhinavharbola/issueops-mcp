@@ -1,7 +1,6 @@
 import math
 import os
 import sys
-import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -24,11 +23,6 @@ read_client = GitHubReadClient(config.github_read_pat)
 write_client = GitHubWriteClient(config.github_write_pat)
 
 
-@st.cache_resource
-def _shared_failures():
-    return []
-
-
 def _enforce_access():
     expected = config.dashboard_access_token
     if not expected:
@@ -47,20 +41,8 @@ def _enforce_access():
         return
 
     entered = st.sidebar.text_input("Access token", type="password", key="dashboard_token")
-    now = time.time()
-    session_failures = auth.recent(st.session_state.get("token_failures", []), now)
-    st.session_state["token_failures"] = session_failures
-    if auth.is_locked(session_failures, now):
-        st.sidebar.error("Too many failed attempts from this session. Wait a minute and try again.")
-        st.stop()
     if auth.token_matches(entered, expected):
         return
-    if entered:
-        session_failures.append(now)
-        shared = _shared_failures()
-        shared[:] = auth.recent(shared, now)
-        shared.append(now)
-        time.sleep(auth.failure_delay_seconds(len(shared)))
     st.sidebar.error("Enter the correct access token to view or act on pending actions.")
     st.stop()
 
@@ -277,3 +259,5 @@ st.subheader("Recent audit log")
 with sync_connection(config.neon_dsn) as conn:
     audit_rows = actions.list_recent_audit_log(conn)
 st.dataframe(audit_rows, use_container_width=True)
+
+

@@ -150,3 +150,5 @@ CREATE INDEX IF NOT EXISTS idx_pending_actions_requested_by ON pending_actions (
 CREATE INDEX IF NOT EXISTS idx_pending_actions_approving ON pending_actions (claimed_at) WHERE status = 'approving';
 CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log (timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_log_pending_action ON audit_log (pending_action_id);
+
+

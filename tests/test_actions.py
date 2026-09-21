@@ -803,3 +803,5 @@ def test_resolving_a_row_that_is_not_in_needs_review_does_nothing():
 
     assert result == {"status": "not_found_or_not_needs_review"}
     assert not any(sql.startswith("UPDATE pending_actions") for sql, _ in conn.queries)
+
+
