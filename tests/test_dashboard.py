@@ -179,3 +179,45 @@ def test_a_proposal_without_a_stored_excerpt_still_renders(monkeypatch, dashboar
 
     assert not at.exception
     assert any("No issue text was stored" in c.value for c in at.caption)
+
+
+@needs_database
+def test_a_match_outside_the_stored_text_is_called_out(monkeypatch, dashboard_dsn):
+    _insert(
+        dashboard_dsn, flagged=True,
+        excerpt={
+            "title": "t", "body": "b", "comments": [], "comments_omitted": 0,
+            "comments_truncated_by_fetcher": False, "flag_matches": ["system prompt"],
+            "flag_matches_not_shown": ["system prompt"], "text_truncated": True,
+        },
+    )
+
+    at = _run(monkeypatch, dsn=dashboard_dsn, DASHBOARD_ALLOW_INSECURE="true")
+
+    assert not at.exception
+    assert any("NOT stored or shown" in e.value for e in at.error)
+    assert any("cut to fit storage" in c.value for c in at.caption)
+
+
+@needs_database
+def test_a_needs_review_row_is_listed_and_can_be_resolved(monkeypatch, dashboard_dsn):
+    import psycopg
+
+    action_id = _insert(dashboard_dsn)
+    with psycopg.connect(dashboard_dsn, autocommit=True) as conn:
+        conn.execute(
+            "UPDATE pending_actions SET status = 'needs_review', claimed_by = 'alice', claimed_at = now(), "
+            "execution_started_at = now() WHERE id = %s",
+            (action_id,),
+        )
+
+    at = _run(monkeypatch, dsn=dashboard_dsn, DASHBOARD_ALLOW_INSECURE="true")
+    at.sidebar.text_input(key="approver_name").set_value("bob").run()
+
+    assert not at.exception
+    assert any("need review" in w.value for w in at.sidebar.warning)
+    next(b for b in at.button if b.label == "It was applied on GitHub").click().run()
+
+    with psycopg.connect(dashboard_dsn, autocommit=True) as conn:
+        status = conn.execute("SELECT status FROM pending_actions WHERE id = %s", (action_id,)).fetchone()[0]
+    assert status == "executed"

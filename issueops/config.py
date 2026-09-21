@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from dotenv import dotenv_values, find_dotenv
 
@@ -8,17 +8,17 @@ WRITE_PAT_NAME = "GITHUB_WRITE_PAT"
 
 @dataclass(frozen=True)
 class Config:
-    neon_dsn: str
-    github_read_pat: str
-    github_write_pat: str | None
-    groq_api_key: str | None
-    groq_api_key_fallback: str | None
-    logfire_token: str | None
+    neon_dsn: str = field(repr=False)
+    github_read_pat: str = field(repr=False)
+    github_write_pat: str | None = field(repr=False)
+    groq_api_key: str | None = field(repr=False)
+    groq_api_key_fallback: str | None = field(repr=False)
+    logfire_token: str | None = field(repr=False)
     pending_action_ttl_hours: int = 48
     stuck_approving_recovery_minutes: int = 10
     comment_body_max_chars: int = 65536
     mcp_client_label: str | None = None
-    dashboard_access_token: str | None = None
+    dashboard_access_token: str | None = field(default=None, repr=False)
     dashboard_allow_insecure: bool = False
 
 

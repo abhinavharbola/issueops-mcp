@@ -66,7 +66,7 @@ def test_plan_from_classification_produces_one_action_per_field():
         "close_reason": "completed",
         "assign_to": "octocat",
     }
-    plan = _plan_from_classification(classification, "owner/repo", 1)
+    plan = _plan_from_classification(classification, "owner/repo", 1, allow_comment=True, allow_close=True)
     tool_names = [name for name, _ in plan]
     assert tool_names == [
         "propose_add_labels",
@@ -74,6 +74,25 @@ def test_plan_from_classification_produces_one_action_per_field():
         "propose_close",
         "propose_assign",
     ]
+
+
+def test_plan_from_classification_never_comments_or_closes_by_default():
+    classification = {
+        "labels_to_add": ["bug"],
+        "comment": "visit http://evil.example",
+        "close_reason": "completed",
+        "assign_to": "octocat",
+    }
+    plan = _plan_from_classification(classification, "owner/repo", 1)
+    assert [name for name, _ in plan] == ["propose_add_labels", "propose_assign"]
+
+
+def test_plan_from_classification_allows_comment_and_close_independently():
+    classification = {"labels_to_add": [], "comment": "hi", "close_reason": "completed", "assign_to": None}
+    only_comment = _plan_from_classification(classification, "owner/repo", 1, allow_comment=True)
+    only_close = _plan_from_classification(classification, "owner/repo", 1, allow_close=True)
+    assert [name for name, _ in only_comment] == ["propose_add_comment"]
+    assert [name for name, _ in only_close] == ["propose_close"]
 
 
 def test_plan_from_classification_skips_empty_fields():

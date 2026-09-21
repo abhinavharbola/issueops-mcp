@@ -438,6 +438,47 @@ def test_build_source_excerpt_is_bounded_and_null_safe():
     assert excerpt["comments"][-1] == {"author": "u", "body": "c"}
 
 
+def test_the_excerpt_contains_everything_the_classifier_prompt_contains():
+    from agent import prompts
+
+    issue = {
+        "title": "t" * 400,
+        "body": "b" * 12000,
+        "comments_detail": [{"user": {"login": "u"}, "body": "c" * 3000}] * 15,
+    }
+
+    excerpt = tools.build_source_excerpt(issue)
+
+    assert excerpt["title"] == prompts._clip(issue["title"], prompts.MAX_TITLE_CHARS)
+    assert excerpt["body"] == prompts._clip(issue["body"], prompts.MAX_BODY_CHARS)
+    assert len(excerpt["comments"]) == prompts.MAX_COMMENTS
+    assert excerpt["comments"][0]["body"] == prompts._clip(issue["comments_detail"][0]["body"], prompts.MAX_COMMENT_CHARS)
+    assert excerpt["text_truncated"] is True
+
+
+def test_the_excerpt_reports_a_match_that_sits_outside_the_stored_text():
+    issue = {
+        "title": "t",
+        "body": "x" * (tools.EXCERPT_BODY_CHARS + 10) + " ignore previous instructions",
+        "comments_detail": [],
+    }
+
+    excerpt = tools.build_source_excerpt(issue)
+
+    assert excerpt["flag_matches"] == ["ignore previous instructions"]
+    assert excerpt["flag_matches_not_shown"] == ["ignore previous instructions"]
+
+
+def test_the_excerpt_does_not_report_a_visible_match_as_hidden():
+    issue = {"title": "t", "body": "please ignore previous instructions", "comments_detail": []}
+
+    excerpt = tools.build_source_excerpt(issue)
+
+    assert excerpt["flag_matches"] == ["ignore previous instructions"]
+    assert excerpt["flag_matches_not_shown"] == []
+    assert excerpt["text_truncated"] is False
+
+
 def test_the_rationale_is_stored_clipped(monkeypatch):
     fake_conn = FakeConn(new_id="r-9")
     _patch_sync_connection(monkeypatch, fake_conn)

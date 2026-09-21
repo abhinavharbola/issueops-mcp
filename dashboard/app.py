@@ -79,6 +79,8 @@ if "last_action_result" in st.session_state:
         st.success(f"Executed: {result}")
     elif result["status"] == "rejected":
         st.info(f"Rejected: {result}")
+    elif result["status"] == "requeued":
+        st.info(f"Returned to the pending list: {result}")
     elif result["status"] == "released":
         st.warning(
             f"GitHub could not be read, so nothing was sent. The action is back in the pending "
@@ -87,8 +89,8 @@ if "last_action_result" in st.session_state:
     elif result["status"] == "recording_failed":
         st.warning(
             f"The database write failed after retries. The GitHub call may have been applied: "
-            f"check the issue on GitHub before approving again. The row stays in approving until "
-            f"recovery returns it to pending: {result}"
+            f"check the issue on GitHub. The row stays in approving until recovery moves it to the "
+            f"Needs review section, where a person records what actually happened: {result}"
         )
     elif result["status"] == "error":
         st.error(f"The action could not be processed: {result}")
@@ -110,10 +112,13 @@ with sync_connection(config.neon_dsn) as conn:
     actions.expire_stale_pending(conn, ttl_hours=config.pending_action_ttl_hours)
     actions.recover_stuck_approving(conn, minutes=config.stuck_approving_recovery_minutes)
     total_pending = actions.count_pending_actions(conn)
+    total_needs_review = actions.count_needs_review(conn)
 
 page_count = max(1, math.ceil(total_pending / PAGE_SIZE))
 page = st.sidebar.number_input("Page", min_value=1, max_value=page_count, value=1, step=1)
 st.sidebar.caption(f"{total_pending} pending action(s), {PAGE_SIZE} per page")
+if total_needs_review:
+    st.sidebar.warning(f"{total_needs_review} action(s) need review: outcome unknown")
 
 with sync_connection(config.neon_dsn) as conn:
     pending = actions.list_pending_actions(conn, limit=PAGE_SIZE, offset=(int(page) - 1) * PAGE_SIZE)
@@ -142,7 +147,22 @@ else:
                         "The issue text contains phrases that look like prompt injection: "
                         + ", ".join(excerpt["flag_matches"])
                     )
-                st.write("Issue text the proposer saw")
+                if excerpt.get("flag_matches_not_shown"):
+                    st.error(
+                        "These phrases appear in issue text that is NOT stored or shown here: "
+                        + ", ".join(excerpt["flag_matches_not_shown"])
+                        + ". Load the current issue and read it before acting."
+                    )
+                if excerpt.get("text_truncated"):
+                    st.caption(
+                        "Part of the title, body, or a comment was cut to fit storage. Load the current issue "
+                        "to read the rest."
+                    )
+                if not str(row["requested_by"]).startswith("agent:"):
+                    st.caption(
+                        "This came from an MCP client, which may have read more of the issue than is stored here."
+                    )
+                st.write("Issue text stored with this proposal")
                 st.text(excerpt.get("title") or "(no title)")
                 st.text(excerpt.get("body") or "(no body)")
                 if excerpt.get("comments_omitted"):
@@ -214,6 +234,43 @@ else:
 
     if not approver:
         st.warning("Enter your name in the sidebar to enable approve/reject.")
+
+
+def _resolve(action_id, applied):
+    try:
+        with sync_connection(config.neon_dsn) as conn:
+            result = actions.resolve_needs_review(conn, action_id, approver, applied)
+    except Exception as exc:
+        result = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+    st.session_state["last_action_result"] = result
+    st.rerun()
+
+
+with sync_connection(config.neon_dsn) as conn:
+    review_rows = actions.list_needs_review(conn)
+
+if review_rows:
+    st.divider()
+    st.subheader("Needs review: outcome unknown")
+    st.caption(
+        "An approval started its GitHub call and never recorded the result. It may or may not have been applied. "
+        "Open the issue on GitHub, check, and record what you found."
+    )
+    for row in review_rows:
+        header = f"{row['tool_name']} on {row['repo']}#{row['issue_number']}"
+        with st.expander(header, expanded=True):
+            st.json(row["arguments"])
+            st.caption(
+                f"Approval started by {row['claimed_by']} at {row['claimed_at']}; "
+                f"GitHub call started at {row['execution_started_at']}"
+            )
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("It was applied on GitHub", key=f"applied_{row['id']}", disabled=not approver):
+                    _resolve(row["id"], True)
+            with col2:
+                if st.button("It was not applied, return to pending", key=f"notapplied_{row['id']}", disabled=not approver):
+                    _resolve(row["id"], False)
 
 st.divider()
 st.subheader("Recent audit log")

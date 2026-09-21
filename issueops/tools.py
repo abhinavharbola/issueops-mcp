@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 from psycopg.types.json import Jsonb
 
+from issueops import limits
 from issueops.db import sync_connection
 from issueops.github_client import GitHubReadClient, PaginationLimitExceededError
 from issueops.heuristics import flag_matches, is_heuristically_flagged
@@ -341,7 +342,7 @@ def list_handled_issue_numbers(dsn, repo: str) -> set[int]:
             """
             SELECT DISTINCT issue_number FROM pending_actions
             WHERE repo = %s AND requested_by LIKE %s
-              AND status IN ('pending', 'approving', 'rejected', 'executed')
+              AND status IN ('pending', 'approving', 'needs_review', 'rejected', 'executed')
             """,
             (repo, "agent:%"),
         ).fetchall()
@@ -409,10 +410,10 @@ def _find_existing_pending(conn, repo, issue_number, tool_name, arguments: dict)
     return None
 
 
-EXCERPT_TITLE_CHARS = 300
-EXCERPT_BODY_CHARS = 4000
-EXCERPT_COMMENT_CHARS = 1000
-EXCERPT_MAX_COMMENTS = 10
+EXCERPT_TITLE_CHARS = limits.TITLE_CHARS
+EXCERPT_BODY_CHARS = limits.BODY_CHARS
+EXCERPT_COMMENT_CHARS = limits.COMMENT_CHARS
+EXCERPT_MAX_COMMENTS = limits.MAX_COMMENTS
 RATIONALE_MAX_CHARS = 2000
 LOCK_NAMESPACE_INITIATOR = 1
 LOCK_NAMESPACE_ISSUE = 2
@@ -425,21 +426,37 @@ def _clip(text: str, limit: int) -> str:
 
 
 def build_source_excerpt(issue: dict) -> dict:
+    title = issue.get("title") or ""
+    body = issue.get("body") or ""
     comments = issue.get("comments_detail") or []
     recent = comments[-EXCERPT_MAX_COMMENTS:]
+    shown_comments = [
+        {
+            "author": (c.get("user") or {}).get("login") or "unknown",
+            "body": _clip(c.get("body") or "", EXCERPT_COMMENT_CHARS),
+        }
+        for c in recent
+    ]
+    shown_title = _clip(title, EXCERPT_TITLE_CHARS)
+    shown_body = _clip(body, EXCERPT_BODY_CHARS)
+    all_matches = flag_matches(issue_plaintext(issue))
+    shown_text = " ".join([shown_title, shown_body] + [c["body"] for c in shown_comments])
+    visible_matches = set(flag_matches(shown_text))
+    hidden_matches = [phrase for phrase in all_matches if phrase not in visible_matches]
+    text_cut = (
+        len(title) > EXCERPT_TITLE_CHARS
+        or len(body) > EXCERPT_BODY_CHARS
+        or any(len(c.get("body") or "") > EXCERPT_COMMENT_CHARS for c in recent)
+    )
     return {
-        "title": _clip(issue.get("title") or "", EXCERPT_TITLE_CHARS),
-        "body": _clip(issue.get("body") or "", EXCERPT_BODY_CHARS),
-        "comments": [
-            {
-                "author": (c.get("user") or {}).get("login") or "unknown",
-                "body": _clip(c.get("body") or "", EXCERPT_COMMENT_CHARS),
-            }
-            for c in recent
-        ],
+        "title": shown_title,
+        "body": shown_body,
+        "comments": shown_comments,
         "comments_omitted": len(comments) - len(recent),
         "comments_truncated_by_fetcher": bool(issue.get("comments_truncated")),
-        "flag_matches": flag_matches(issue_plaintext(issue)),
+        "text_truncated": text_cut,
+        "flag_matches": all_matches,
+        "flag_matches_not_shown": hidden_matches,
     }
 
 

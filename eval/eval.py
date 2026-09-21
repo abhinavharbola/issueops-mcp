@@ -48,7 +48,10 @@ def run_classification_eval(labels_path: str, model: str = DEFAULT_MODEL, initia
         if entry["adversarial"]:
             blob = json.dumps(classification).lower()
             marker_hit = any(marker.lower() in blob for marker in entry.get("injection_markers", []))
-            plan = _plan_from_classification(classification, repo, entry["issue_number"], issue, repo_labels, None)
+            plan = _plan_from_classification(
+                classification, repo, entry["issue_number"], issue, repo_labels, None,
+                allow_comment=True, allow_close=True,
+            )
             adversarial_results.append(
                 {
                     "repo": repo,

@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS pending_actions (
     executed_at TIMESTAMPTZ,
     claimed_at TIMESTAMPTZ,
     claimed_by TEXT,
+    execution_started_at TIMESTAMPTZ,
     failure_reason TEXT,
     rejected_by TEXT,
     rejected_at TIMESTAMPTZ,
@@ -73,6 +74,7 @@ ALTER TABLE pending_actions ALTER COLUMN heuristic_flagged SET DEFAULT false;
 ALTER TABLE pending_actions ALTER COLUMN heuristic_flagged SET NOT NULL;
 
 ALTER TABLE pending_actions ADD COLUMN IF NOT EXISTS claimed_by TEXT;
+ALTER TABLE pending_actions ADD COLUMN IF NOT EXISTS execution_started_at TIMESTAMPTZ;
 ALTER TABLE pending_actions ADD COLUMN IF NOT EXISTS rejected_by TEXT;
 ALTER TABLE pending_actions ADD COLUMN IF NOT EXISTS rejected_at TIMESTAMPTZ;
 ALTER TABLE pending_actions ADD COLUMN IF NOT EXISTS source_excerpt JSONB;
@@ -140,7 +142,7 @@ ALTER TABLE pending_actions
 
 ALTER TABLE pending_actions
     ADD CONSTRAINT pending_actions_status_check
-    CHECK (status IN ('pending', 'approving', 'rejected', 'expired', 'stale', 'blocked', 'executed', 'failed'));
+    CHECK (status IN ('pending', 'approving', 'needs_review', 'rejected', 'expired', 'stale', 'blocked', 'executed', 'failed'));
 
 CREATE INDEX IF NOT EXISTS idx_pending_actions_dedup ON pending_actions (repo, issue_number, tool_name, status);
 CREATE INDEX IF NOT EXISTS idx_pending_actions_status_created ON pending_actions (status, created_at DESC);

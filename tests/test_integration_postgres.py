@@ -95,24 +95,113 @@ def test_two_concurrent_approvals_execute_the_action_exactly_once(dsn):
     assert _status(dsn, action_id) == "executed"
 
 
-def test_a_lease_reclaimed_during_the_github_call_is_reported_not_recorded_as_success(dsn):
+def test_a_recovery_during_the_github_call_sends_the_row_to_needs_review_not_pending(dsn):
     action_id = _insert_pending(dsn)
     read_client = _read_client()
     write_client = MagicMock()
 
-    def reclaim_while_the_call_is_in_flight(*args, **kwargs):
+    def recover_while_the_call_is_in_flight(*args, **kwargs):
         with tools.sync_connection(dsn) as other:
             actions.recover_stuck_approving(other, minutes=0)
-            row, lease, early = actions._claim_pending_action(other, action_id, "bob", 48)
-            assert early is None
 
-    write_client.add_comment.side_effect = reclaim_while_the_call_is_in_flight
+    write_client.add_comment.side_effect = recover_while_the_call_is_in_flight
 
     with tools.sync_connection(dsn) as conn:
         result = actions.approve_action(conn, read_client, write_client, action_id, "alice")
 
     assert result["status"] == "lost_lease_after_execution"
+    assert _status(dsn, action_id) == "needs_review"
+    assert _count(dsn, "SELECT count(*) AS n FROM audit_log WHERE result_status = 'needs_review'") == 1
+
+
+def test_a_claim_reclaimed_before_the_github_call_sends_nothing(dsn):
+    action_id = _insert_pending(dsn)
+    read_client = _read_client()
+    write_client = MagicMock()
+
+    def reclaim_before_any_write(*args, **kwargs):
+        with tools.sync_connection(dsn) as other:
+            actions.recover_stuck_approving(other, minutes=0)
+            row, lease, early = actions._claim_pending_action(other, action_id, "bob", 48)
+            assert early is None
+        return read_client.get_issue.return_value
+
+    read_client.get_issue.side_effect = reclaim_before_any_write
+
+    with tools.sync_connection(dsn) as conn:
+        result = actions.approve_action(conn, read_client, write_client, action_id, "alice")
+
+    assert result["status"] == "lost_lease"
+    write_client.add_comment.assert_not_called()
     assert _status(dsn, action_id) == "approving"
+
+
+def test_a_row_stuck_after_a_recording_failure_becomes_needs_review_and_can_be_resolved(dsn):
+    action_id = _insert_pending(dsn)
+    with tools.sync_connection(dsn) as conn:
+        conn.execute(
+            "UPDATE pending_actions SET status = 'approving', claimed_at = now() - interval '30 minutes', "
+            "claimed_by = 'alice', execution_started_at = now() - interval '30 minutes' WHERE id = %s",
+            (action_id,),
+        )
+        recovered = actions.recover_stuck_approving(conn, minutes=10)
+        row = conn.execute(
+            "SELECT status, claimed_by, execution_started_at FROM pending_actions WHERE id = %s", (action_id,)
+        ).fetchone()
+        listed = actions.list_needs_review(conn)
+        counted = actions.count_needs_review(conn)
+        pending_listed = actions.list_pending_actions(conn)
+
+    assert len(recovered) == 1
+    assert row["status"] == "needs_review"
+    assert row["claimed_by"] == "alice"
+    assert row["execution_started_at"] is not None
+    assert [r["id"] for r in listed] == [recovered[0]["id"]]
+    assert counted == 1
+    assert pending_listed == []
+
+    with tools.sync_connection(dsn) as conn:
+        result = actions.resolve_needs_review(conn, action_id, "bob", applied=True, note="checked the issue")
+        final = conn.execute(
+            "SELECT status, approved_by, executed_at FROM pending_actions WHERE id = %s", (action_id,)
+        ).fetchone()
+
+    assert result == {"status": "executed"}
+    assert final["status"] == "executed"
+    assert final["approved_by"] == "alice"
+    assert final["executed_at"] is not None
+    assert _count(
+        dsn, "SELECT count(*) AS n FROM audit_log WHERE result_status = 'executed' AND initiator = 'bob'"
+    ) == 1
+
+
+def test_resolving_needs_review_as_not_applied_requeues_and_clears_the_marker(dsn):
+    action_id = _insert_pending(dsn)
+    with tools.sync_connection(dsn) as conn:
+        conn.execute(
+            "UPDATE pending_actions SET status = 'needs_review', claimed_at = now(), claimed_by = 'alice', "
+            "execution_started_at = now() WHERE id = %s",
+            (action_id,),
+        )
+        result = actions.resolve_needs_review(conn, action_id, "bob", applied=False)
+        row = conn.execute(
+            "SELECT status, claimed_at, claimed_by, execution_started_at FROM pending_actions WHERE id = %s",
+            (action_id,),
+        ).fetchone()
+
+    assert result == {"status": "requeued"}
+    assert row == {"status": "pending", "claimed_at": None, "claimed_by": None, "execution_started_at": None}
+
+
+def test_a_needs_review_row_is_not_resolved_twice(dsn):
+    action_id = _insert_pending(dsn)
+    with tools.sync_connection(dsn) as conn:
+        conn.execute("UPDATE pending_actions SET status = 'needs_review', claimed_by = 'alice' WHERE id = %s", (action_id,))
+        first = actions.resolve_needs_review(conn, action_id, "bob", applied=True)
+        second = actions.resolve_needs_review(conn, action_id, "carol", applied=False)
+
+    assert first == {"status": "executed"}
+    assert second == {"status": "not_found_or_not_needs_review"}
 
 
 def test_concurrent_identical_proposals_produce_a_single_pending_row(dsn):
@@ -267,7 +356,10 @@ def test_the_schema_upgrades_a_legacy_database_in_place(legacy_dsn):
         with pytest.raises(psycopg.errors.CheckViolation):
             conn.execute("INSERT INTO repo_allowlist (repo) VALUES ('Mixed/Case')")
 
-    assert {"claimed_at", "claimed_by", "failure_reason", "source_excerpt", "rationale", "rejected_by"} <= columns
+    assert {
+        "claimed_at", "claimed_by", "execution_started_at", "failure_reason", "source_excerpt", "rationale",
+        "rejected_by",
+    } <= columns
     assert repos == ["owner/repo"]
     assert pending_repo == "owner/repo"
     assert rejected == {"approved_by": None, "rejected_by": "bob"}
@@ -473,6 +565,9 @@ def test_a_failing_audit_write_rolls_back_the_status_change_instead_of_leaving_i
     assert result["status"] == "recording_failed"
     assert _status(dsn, action_id) == "approving"
     assert _count(dsn, "SELECT count(*) AS n FROM audit_log WHERE result_status = 'executed'") == 0
+    with tools.sync_connection(dsn) as conn:
+        actions.recover_stuck_approving(conn, minutes=0)
+    assert _status(dsn, action_id) == "needs_review"
 
 
 def test_the_claim_is_audited_and_records_who_started_the_approval(dsn):
@@ -792,3 +887,119 @@ def test_the_allowlist_rejects_path_traversal_names_in_the_script_and_in_the_dat
     with tools.sync_connection(dsn) as conn:
         names = [r["repo"] for r in conn.execute("SELECT repo FROM repo_allowlist ORDER BY repo").fetchall()]
     assert "some-org/some.repo_1" in names
+
+
+ROLES_PATH = Path(__file__).resolve().parent.parent / "db" / "roles.sql"
+LEAST_PRIVILEGE_ROLES = ("issueops_proposer", "issueops_approver", "issueops_pruner")
+
+
+@pytest.fixture
+def roles_dsn(dsn):
+    import psycopg
+
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        schema = conn.execute("SELECT current_schema()").fetchone()[0]
+        conn.execute(ROLES_PATH.read_text())
+        for role in LEAST_PRIVILEGE_ROLES:
+            conn.execute(f"GRANT USAGE ON SCHEMA {schema} TO {role}")
+    return dsn
+
+
+def _role_dsn(dsn, role):
+    return f"{dsn}%20-crole%3D{role}"
+
+
+def test_the_proposer_role_can_queue_and_record_triage_but_nothing_else(roles_dsn):
+    import psycopg
+
+    proposer = _role_dsn(roles_dsn, "issueops_proposer")
+
+    result = tools.propose_add_comment(proposer, _read_client(), "owner/repo", 7, "hi", "mcp:test")
+    tools.record_triage_attempt(proposer, "owner/repo", 7, "hash", "no_action")
+
+    assert "queued for approval" in result["preview"]
+    assert tools.list_triage_skips(proposer, "owner/repo") == {7: "hash"}
+    assert tools.list_handled_issue_numbers(proposer, "owner/repo") == set()
+    forbidden = (
+        "UPDATE audit_log SET result_status = 'x'",
+        "DELETE FROM audit_log",
+        "SELECT * FROM audit_log",
+        "UPDATE pending_actions SET status = 'executed'",
+        "INSERT INTO repo_allowlist (repo) VALUES ('evil/repo')",
+        "UPDATE repo_allowlist SET active = true",
+    )
+    with tools.sync_connection(proposer) as conn:
+        for sql in forbidden:
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                conn.execute(sql)
+
+
+def test_the_approver_role_can_approve_and_read_but_cannot_rewrite_the_log_or_queue_proposals(roles_dsn):
+    import psycopg
+
+    action_id = _insert_pending(roles_dsn)
+    approver = _role_dsn(roles_dsn, "issueops_approver")
+    write_client = MagicMock()
+
+    with tools.sync_connection(approver) as conn:
+        result = actions.approve_action(conn, _read_client(), write_client, action_id, "alice", dsn=approver)
+
+    assert result["status"] == "executed"
+    write_client.add_comment.assert_called_once()
+    forbidden = (
+        "UPDATE audit_log SET result_status = 'x'",
+        "DELETE FROM audit_log",
+        "INSERT INTO pending_actions (tool_name, repo, issue_number, arguments, issue_state_snapshot, requested_by) "
+        "VALUES ('propose_close', 'owner/repo', 1, '{}', '{}', 'x')",
+        "INSERT INTO repo_allowlist (repo) VALUES ('evil/repo')",
+    )
+    with tools.sync_connection(approver) as conn:
+        assert actions.list_recent_audit_log(conn)
+        assert actions.count_pending_actions(conn) == 0
+        for sql in forbidden:
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                conn.execute(sql)
+
+
+def test_the_audit_log_trigger_blocks_updates_and_truncate_but_lets_the_pruner_delete(roles_dsn):
+    import psycopg
+
+    with tools.sync_connection(roles_dsn) as conn:
+        conn.execute("INSERT INTO audit_log (tool_name, initiator, result_status) VALUES ('t', 'i', 'ok')")
+        with pytest.raises(psycopg.Error):
+            conn.execute("UPDATE audit_log SET result_status = 'tampered'")
+        with pytest.raises(psycopg.Error):
+            conn.execute("TRUNCATE audit_log")
+
+    pruner = _role_dsn(roles_dsn, "issueops_pruner")
+    with tools.sync_connection(pruner) as conn:
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            conn.execute("UPDATE audit_log SET result_status = 'tampered'")
+        deleted = conn.execute("DELETE FROM audit_log RETURNING 1").fetchall()
+
+    assert len(deleted) == 1
+
+
+def test_the_prune_script_works_under_the_pruner_role(roles_dsn):
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    import prune_audit_log
+
+    with tools.sync_connection(roles_dsn) as conn:
+        conn.execute(
+            "INSERT INTO audit_log (tool_name, initiator, result_status, timestamp) "
+            "VALUES ('t', 'i', 'ok', now() - interval '200 days')"
+        )
+
+    deleted = prune_audit_log.prune(_role_dsn(roles_dsn, "issueops_pruner"), 90)
+
+    assert deleted == 1
+    assert _count(roles_dsn, "SELECT count(*) AS n FROM audit_log WHERE tool_name = 'prune_audit_log'") == 1
+
+
+def test_applying_the_roles_script_twice_is_harmless(roles_dsn):
+    import psycopg
+
+    with psycopg.connect(roles_dsn, autocommit=True) as conn:
+        conn.execute(ROLES_PATH.read_text())

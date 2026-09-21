@@ -87,25 +87,38 @@ def recover_stuck_approving(conn, minutes: int = DEFAULT_STUCK_APPROVING_RECOVER
         rows = conn.execute(
             """
             WITH stuck AS (
-                SELECT id, claimed_by FROM pending_actions
+                SELECT id, claimed_by, execution_started_at FROM pending_actions
                 WHERE status = 'approving' AND claimed_at < now() - (%s * interval '1 minute')
                 FOR UPDATE
             )
             UPDATE pending_actions p
-            SET status = 'pending', claimed_at = NULL, claimed_by = NULL
+            SET status = CASE WHEN stuck.execution_started_at IS NULL THEN 'pending' ELSE 'needs_review' END,
+                claimed_at = CASE WHEN stuck.execution_started_at IS NULL THEN NULL ELSE p.claimed_at END,
+                claimed_by = CASE WHEN stuck.execution_started_at IS NULL THEN NULL ELSE p.claimed_by END
             FROM stuck
             WHERE p.id = stuck.id
-            RETURNING p.id, p.tool_name, p.repo, p.issue_number, p.arguments, stuck.claimed_by AS previous_claimant
+            RETURNING p.id, p.tool_name, p.repo, p.issue_number, p.arguments, p.status,
+                      stuck.claimed_by AS previous_claimant
             """,
             (minutes,),
         ).fetchall()
         for row in rows:
+            claimant = row.get("previous_claimant") or "an unknown approver"
+            if row.get("status") == "needs_review":
+                result_status = "needs_review"
+                summary = (
+                    f"the approval started by {claimant} had already begun its GitHub call and never recorded an "
+                    "outcome; it may or may not have been applied, so a person must check GitHub and resolve it"
+                )
+            else:
+                result_status = "recovered"
+                summary = (
+                    f"reset from a stuck approving state back to pending; the approval had been started by "
+                    f"{claimant} and had not reached GitHub"
+                )
             tools.write_audit_log(
                 conn, row["tool_name"], row["repo"], row["issue_number"], row["arguments"],
-                row["id"], "system:recovery", "recovered",
-                f"reset from a stuck approving state back to pending; the approval had been started by "
-                f"{row.get('previous_claimant') or 'an unknown approver'}",
-                0,
+                row["id"], "system:recovery", result_status, summary, 0,
             )
     return rows
 
@@ -119,6 +132,17 @@ def list_pending_actions(conn, limit: int = 25, offset: int = 0):
     return conn.execute(
         "SELECT * FROM pending_actions WHERE status = 'pending' ORDER BY created_at DESC, id LIMIT %s OFFSET %s",
         (limit, offset),
+    ).fetchall()
+
+
+def count_needs_review(conn) -> int:
+    row = conn.execute("SELECT count(*) AS n FROM pending_actions WHERE status = 'needs_review'").fetchone()
+    return row["n"]
+
+
+def list_needs_review(conn, limit: int = 100):
+    return conn.execute(
+        "SELECT * FROM pending_actions WHERE status = 'needs_review' ORDER BY claimed_at, id LIMIT %s", (limit,)
     ).fetchall()
 
 
@@ -204,6 +228,10 @@ def _claim_pending_action(conn, action_id: str, approver: str, ttl_hours: int):
             "approval started", 0,
         )
         return row, claim_row["claimed_at"], None
+
+
+def _mark_execution_started(conn, action_id: str, lease: object) -> bool:
+    return _finish_with_lease(conn, action_id, lease, "SET execution_started_at = now()")
 
 
 def _lease_is_still_held(conn, action_id: str, lease: object) -> bool:
@@ -295,6 +323,13 @@ def approve_action(
             "SET status = 'stale', failure_reason = %s", (stale_reason,), "stale", stale_reason,
         )
 
+    if not _mark_execution_started(conn, action_id, lease):
+        tools.write_audit_log(
+            conn, tool_name, repo, issue_number, arguments, action_id, approver, "lost_lease",
+            "claim was reclaimed before the GitHub call; nothing was sent to GitHub by this call", 0,
+        )
+        return {"status": "lost_lease"}
+
     try:
         _execute_on_github(write_client, tool_name, repo, issue_number, arguments)
     except Exception as exc:
@@ -372,3 +407,45 @@ def reject_action(conn, action_id: str, approver: str, reason: str | None = None
             action_id, approver, "rejected", reason, 0,
         )
         return {"status": "rejected"}
+
+
+def resolve_needs_review(conn, action_id: str, resolver: str, applied: bool, note: str | None = None):
+    with conn.transaction():
+        row = conn.execute(
+            "SELECT * FROM pending_actions WHERE id = %s AND status = 'needs_review' FOR UPDATE", (action_id,)
+        ).fetchone()
+        if row is None:
+            return {"status": "not_found_or_not_needs_review"}
+
+        detail = f" ({note})" if note else ""
+        if applied:
+            conn.execute(
+                """
+                UPDATE pending_actions
+                SET status = 'executed', approved_by = COALESCE(claimed_by, %s),
+                    approved_at = COALESCE(claimed_at, now()), executed_at = now(), failure_reason = NULL
+                WHERE id = %s
+                """,
+                (resolver, action_id),
+            )
+            tools.write_audit_log(
+                conn, row["tool_name"], row["repo"], row["issue_number"], row["arguments"],
+                action_id, resolver, "executed",
+                f"{resolver} confirmed on GitHub that the action was applied after an unknown outcome{detail}", 0,
+            )
+            return {"status": "executed"}
+
+        conn.execute(
+            """
+            UPDATE pending_actions
+            SET status = 'pending', claimed_at = NULL, claimed_by = NULL, execution_started_at = NULL
+            WHERE id = %s
+            """,
+            (action_id,),
+        )
+        tools.write_audit_log(
+            conn, row["tool_name"], row["repo"], row["issue_number"], row["arguments"],
+            action_id, resolver, "requeued",
+            f"{resolver} confirmed on GitHub that the action was not applied and returned it to pending{detail}", 0,
+        )
+        return {"status": "requeued"}

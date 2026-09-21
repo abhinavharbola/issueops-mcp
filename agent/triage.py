@@ -3,8 +3,9 @@ import json
 import sys
 import time
 
+import psycopg
 import requests
-from groq import BadRequestError, Groq, RateLimitError
+from groq import APIConnectionError, BadRequestError, Groq, InternalServerError, RateLimitError
 
 from agent.heuristics import is_heuristically_flagged
 from agent.prompts import SYSTEM_PROMPT, build_user_prompt
@@ -16,6 +17,13 @@ from issueops.observability import configure_logfire
 DEFAULT_MODEL = "openai/gpt-oss-20b"
 JSON_RESPONSE_FORMAT = {"type": "json_object"}
 MAX_RETRY_AFTER_SECONDS = 60.0
+TRANSIENT_ERRORS = (
+    RateLimitError,
+    APIConnectionError,
+    InternalServerError,
+    requests.exceptions.RequestException,
+    psycopg.OperationalError,
+)
 
 PROPOSE_DISPATCH = {
     "propose_add_labels": lambda dsn, rc, repo, num, args, initiator, flagged, issue, rationale=None, max_body_chars=None: tools.propose_add_labels(
@@ -175,6 +183,16 @@ def classify_issue(
         return _empty_classification(f"unparseable model output: {exc}")
 
 
+def _is_transient(exc: Exception) -> bool:
+    if isinstance(exc, TRANSIENT_ERRORS):
+        return True
+    if isinstance(exc, GitHubAPIError):
+        if exc.status_code >= 500 or exc.status_code == 429:
+            return True
+        return exc.status_code == 403 and "rate limit" in exc.message.lower()
+    return False
+
+
 def _issue_label_names(issue: dict) -> set[str]:
     return {
         (l["name"] if isinstance(l, dict) else str(l)).lower()
@@ -189,6 +207,7 @@ def _issue_assignee_logins(issue: dict) -> set[str]:
 def _plan_from_classification(
     classification: dict, repo: str, issue_number: int,
     issue: dict | None = None, repo_labels: list[str] | None = None, assignable: list[str] | None = None,
+    allow_comment: bool = False, allow_close: bool = False,
 ) -> list[tuple[str, dict]]:
     plan = []
 
@@ -208,11 +227,11 @@ def _plan_from_classification(
         plan.append(("propose_add_labels", {"labels": labels}))
 
     comment = classification.get("comment")
-    if comment:
+    if comment and allow_comment:
         plan.append(("propose_add_comment", {"body": comment}))
 
     close_reason = classification.get("close_reason")
-    if close_reason and (issue is None or issue.get("state") == "open"):
+    if close_reason and allow_close and (issue is None or issue.get("state") == "open"):
         plan.append(("propose_close", {"reason": close_reason}))
 
     assign_to = classification.get("assign_to")
@@ -227,6 +246,7 @@ def _plan_from_classification(
 def run_triage(
     repo: str, initiator: str, state: str = "open", max_issues: int | None = None,
     model: str = DEFAULT_MODEL, since: str | None = None, max_pages: int = 20,
+    allow_comment: bool = False, allow_close: bool = False,
 ):
     repo = tools.normalize_repo(repo)
     config = load_config(require_write_pat=False, require_groq=True)
@@ -263,6 +283,7 @@ def run_triage(
         assignable = []
 
     queue_full = False
+    rate_limited = False
     for summary in candidates:
         issue_number = summary.get("number")
         summary_hash = tools.content_hash(summary.get("title"), summary.get("body"))
@@ -276,7 +297,10 @@ def run_triage(
             issue = tools.get_issue(dsn, read_client, repo, issue_number, initiator)
             flagged = is_heuristically_flagged(tools.issue_plaintext(issue))
             classification = classify_issue(groq_clients, model, issue, repo_labels, assignable)
-            plan = _plan_from_classification(classification, repo, issue_number, issue, repo_labels, assignable)
+            plan = _plan_from_classification(
+                classification, repo, issue_number, issue, repo_labels, assignable,
+                allow_comment=allow_comment and not flagged, allow_close=allow_close and not flagged,
+            )
 
             for tool_name, args in plan:
                 dedup_key = (tool_name, repo, issue_number, json.dumps(args, sort_keys=True))
@@ -311,6 +335,11 @@ def run_triage(
             )
         except Exception as exc:
             error_text = f"{type(exc).__name__}: {exc}"
+            transient = _is_transient(exc)
+            if transient:
+                defer = True
+            if isinstance(exc, RateLimitError):
+                rate_limited = True
             results.append(
                 {
                     "issue_number": issue_number,
@@ -319,6 +348,7 @@ def run_triage(
                     "proposals": proposals,
                     "outcome": "error",
                     "error": error_text,
+                    "transient": transient,
                 }
             )
 
@@ -327,6 +357,14 @@ def run_triage(
                 tools.record_triage_attempt(dsn, repo, issue_number, summary_hash, outcome, error_text)
             except Exception as exc:
                 print(f"warning: could not record the triage attempt for #{issue_number}: {exc}", file=sys.stderr)
+
+        if rate_limited:
+            print(
+                f"warning: the model provider is rate limiting requests; stopping after #{issue_number}. "
+                "Issues that failed for this reason are not recorded as attempted and will be retried next run.",
+                file=sys.stderr,
+            )
+            break
 
         if queue_full:
             print(
@@ -351,12 +389,18 @@ def main():
     parser.add_argument("--since", default=None, help="only issues updated at or after this ISO 8601 timestamp")
     parser.add_argument("--max-pages", type=int, default=20)
     parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument(
+        "--allow-comment", action="store_true",
+        help="let the agent propose free-text comments (labels and assignments are always allowed)",
+    )
+    parser.add_argument("--allow-close", action="store_true", help="let the agent propose closing issues")
     args = parser.parse_args()
 
     try:
         results = run_triage(
             args.repo, initiator="agent:cli", state=args.state, max_issues=args.max_issues,
             model=args.model, since=args.since, max_pages=args.max_pages,
+            allow_comment=args.allow_comment, allow_close=args.allow_close,
         )
     except (GitHubAPIError, tools.RepoNotAllowedError, requests.exceptions.RequestException, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)

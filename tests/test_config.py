@@ -252,3 +252,24 @@ def test_dashboard_allow_insecure_defaults_to_false(monkeypatch):
     _set_minimum_required_env(monkeypatch)
 
     assert config.load_config(require_write_pat=False).dashboard_allow_insecure is False
+
+
+def test_repr_never_contains_a_secret(monkeypatch):
+    secrets = {
+        "NEON_DSN": "postgresql://user:dsn-secret@host/db",
+        "GITHUB_READ_PAT": "read-secret",
+        "GITHUB_WRITE_PAT": "write-secret",
+        "GROQ_API_KEY": "groq-secret",
+        "GROQ_API_KEY_FALLBACK": "groq-fallback-secret",
+        "LOGFIRE_TOKEN": "logfire-secret",
+        "DASHBOARD_ACCESS_TOKEN": "dashboard-secret",
+    }
+    monkeypatch.setenv("ISSUEOPS_ENV_FILE", os.devnull)
+    for name, value in secrets.items():
+        monkeypatch.setenv(name, value)
+
+    loaded = config.load_config(require_write_pat=True)
+
+    rendered = repr(loaded) + str(loaded)
+    for value in secrets.values():
+        assert value not in rendered
