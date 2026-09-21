@@ -447,7 +447,9 @@ def test_a_flagged_issue_never_gets_a_comment_or_close_even_when_allowed(monkeyp
     [
         _http_error(triage.RateLimitError, 429),
         _http_error(triage.InternalServerError, 503),
-        triage.APIConnectionError(),
+        triage.APIConnectionError(
+            request=httpx.Request("POST", "https://api.groq.com/x")
+        ),
         triage.requests.exceptions.ConnectionError("dns"),
         triage.GitHubAPIError(502, "bad gateway"),
         triage.GitHubAPIError(429, "slow down"),
