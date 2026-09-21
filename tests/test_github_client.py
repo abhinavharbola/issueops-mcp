@@ -191,3 +191,92 @@ def test_list_issues_passes_max_pages_to_the_pagination_guard():
 
     with pytest.raises(PaginationLimitExceededError):
         client.list_issues("o/r", max_pages=1)
+
+
+def test_link_header_with_a_comma_inside_the_url_still_paginates():
+    client = GitHubReadClient("fake-pat")
+    page1 = _mock_response(
+        200,
+        json_data=[{"number": 1}],
+        headers={"Link": '<https://api.github.com/repos/o/r/issues?labels=a,b&page=2>; rel="next", <https://api.github.com/repos/o/r/issues?page=9>; rel="last"'},
+    )
+    page2 = _mock_response(200, json_data=[{"number": 2}], headers={})
+    client._session.request = MagicMock(side_effect=[page1, page2])
+
+    issues = client.list_issues("o/r")
+
+    assert [i["number"] for i in issues] == [1, 2]
+    assert client._session.request.call_args_list[1].args[1].endswith("labels=a,b&page=2")
+
+
+def test_a_pagination_link_pointing_outside_the_api_is_rejected():
+    client = GitHubReadClient("fake-pat")
+    page1 = _mock_response(
+        200, json_data=[{"number": 1}], headers={"Link": '<https://evil.example/x?page=2>; rel="next"'},
+    )
+    client._session.request = MagicMock(return_value=page1)
+
+    with pytest.raises(GitHubAPIError):
+        client.list_issues("o/r")
+
+
+def test_iter_issue_pages_yields_page_by_page_and_stops_early_without_extra_requests():
+    client = GitHubReadClient("fake-pat")
+    page1 = _mock_response(
+        200, json_data=[{"number": 1}],
+        headers={"Link": '<https://api.github.com/repos/o/r/issues?page=2>; rel="next"'},
+    )
+    client._session.request = MagicMock(return_value=page1)
+
+    pages = client.iter_issue_pages("o/r", max_pages=5)
+    first = next(pages)
+    pages.close()
+
+    assert first == [{"number": 1}]
+    assert client._session.request.call_count == 1
+
+
+def test_iter_issue_pages_raises_only_after_the_last_allowed_page_was_yielded():
+    client = GitHubReadClient("fake-pat")
+    always_next = _mock_response(
+        200, json_data=[{"number": 1}],
+        headers={"Link": '<https://api.github.com/repos/o/r/issues?page=2>; rel="next"'},
+    )
+    client._session.request = MagicMock(return_value=always_next)
+    seen = []
+
+    with pytest.raises(PaginationLimitExceededError):
+        for page in client.iter_issue_pages("o/r", max_pages=2):
+            seen.append(page)
+
+    assert len(seen) == 2
+
+
+def test_get_issue_returns_partial_comments_flagged_when_the_comment_pages_exceed_the_limit():
+    client = GitHubReadClient("fake-pat")
+    issue_response = _mock_response(200, json_data={"number": 1})
+    comment_page = _mock_response(
+        200, json_data=[{"body": "c"}],
+        headers={"Link": '<https://api.github.com/repos/o/r/issues/1/comments?page=2>; rel="next"'},
+    )
+    client._session.request = MagicMock(side_effect=[issue_response] + [comment_page] * 25)
+
+    issue = client.get_issue("o/r", 1)
+
+    assert len(issue["comments_detail"]) == 20
+    assert issue["comments_truncated"] is True
+
+
+def test_get_issue_comments_partial_mode_returns_what_was_read_instead_of_raising():
+    client = GitHubReadClient("fake-pat")
+    comment_page = _mock_response(
+        200, json_data=[{"body": "c"}],
+        headers={"Link": '<https://api.github.com/repos/o/r/issues/1/comments?page=2>; rel="next"'},
+    )
+    client._session.request = MagicMock(return_value=comment_page)
+
+    comments = client.get_issue_comments("o/r", 1, max_pages=2, allow_partial=True)
+
+    assert len(comments) == 2
+    with pytest.raises(PaginationLimitExceededError):
+        client.get_issue_comments("o/r", 1, max_pages=2)

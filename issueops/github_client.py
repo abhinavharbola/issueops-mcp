@@ -1,8 +1,11 @@
+import re
 from urllib.parse import quote
 
 import requests
 
 GITHUB_API_BASE = "https://api.github.com"
+
+_LINK_PATTERN = re.compile(r'<([^>]+)>\s*;\s*rel="([^"]+)"')
 
 
 class GitHubAPIError(Exception):
@@ -48,8 +51,22 @@ class _BaseClient:
             raise GitHubAPIError(response.status_code, response.text)
         return response
 
-    def _paginated_get(self, path: str, params: dict, max_pages: int = 20):
-        results = []
+    @staticmethod
+    def _next_path(response):
+        link_header = response.headers.get("Link")
+        if not link_header:
+            return None
+        for url, rel in _LINK_PATTERN.findall(link_header):
+            if rel != "next":
+                continue
+            if not url.startswith(GITHUB_API_BASE):
+                raise GitHubAPIError(
+                    response.status_code, f"pagination link points outside the GitHub API: {url}"
+                )
+            return url[len(GITHUB_API_BASE):]
+        return None
+
+    def _paginated_iter(self, path: str, params: dict, max_pages: int = 20):
         page_params = dict(params)
         page_params.setdefault("per_page", 100)
         next_path = path
@@ -60,9 +77,9 @@ class _BaseClient:
             response = self._request_raw("GET", next_path, params=next_params)
             data = response.json()
             if isinstance(data, dict) and "items" in data:
-                results.extend(data["items"])
+                items = data["items"]
             elif isinstance(data, list):
-                results.extend(data)
+                items = data
             else:
                 raise GitHubAPIError(
                     response.status_code,
@@ -70,53 +87,80 @@ class _BaseClient:
                     f"with an 'items' key, got {type(data).__name__}",
                 )
             pages_fetched += 1
-
-            next_path = None
+            next_path = self._next_path(response)
             next_params = None
-            link_header = response.headers.get("Link")
-            if link_header:
-                for part in link_header.split(","):
-                    segment = part.strip()
-                    if 'rel="next"' not in segment:
-                        continue
-                    start = segment.find("<")
-                    end = segment.find(">")
-                    if start == -1 or end == -1:
-                        continue
-                    next_url = segment[start + 1:end]
-                    next_path = next_url[len(GITHUB_API_BASE):]
-                    next_params = None
-                    break
+            yield items
 
         if next_path is not None:
             raise PaginationLimitExceededError(path, max_pages)
 
+    def _paginated_get(self, path: str, params: dict, max_pages: int = 20):
+        results = []
+        for items in self._paginated_iter(path, params, max_pages=max_pages):
+            results.extend(items)
         return results
+
+    def _paginated_partial(self, path: str, params: dict, max_pages: int = 20):
+        results = []
+        try:
+            for items in self._paginated_iter(path, params, max_pages=max_pages):
+                results.extend(items)
+        except PaginationLimitExceededError:
+            return results, True
+        return results, False
 
 
 class GitHubReadClient(_BaseClient):
-    def list_issues(
-        self, repo: str, state: str = "open", labels: list[str] | None = None,
-        since: str | None = None, max_pages: int = 20,
-    ):
+    @staticmethod
+    def _issue_params(state: str, labels: list[str] | None, since: str | None) -> dict:
         params = {"state": state}
         if labels:
             params["labels"] = ",".join(labels)
         if since:
             params["since"] = since
-        return self._paginated_get(f"/repos/{repo}/issues", params, max_pages=max_pages)
+        return params
+
+    def list_issues(
+        self, repo: str, state: str = "open", labels: list[str] | None = None,
+        since: str | None = None, max_pages: int = 20,
+    ):
+        return self._paginated_get(
+            f"/repos/{repo}/issues", self._issue_params(state, labels, since), max_pages=max_pages
+        )
+
+    def iter_issue_pages(
+        self, repo: str, state: str = "open", labels: list[str] | None = None,
+        since: str | None = None, max_pages: int = 20,
+    ):
+        return self._paginated_iter(
+            f"/repos/{repo}/issues", self._issue_params(state, labels, since), max_pages=max_pages
+        )
 
     def get_issue(self, repo: str, issue_number: int, include_comments: bool = True):
         issue = self._request("GET", f"/repos/{repo}/issues/{issue_number}")
         if include_comments:
-            issue["comments_detail"] = self.get_issue_comments(repo, issue_number)
+            comments, truncated = self._paginated_partial(
+                f"/repos/{repo}/issues/{issue_number}/comments", {}
+            )
+            issue["comments_detail"] = comments
+            if truncated:
+                issue["comments_truncated"] = True
         return issue
 
-    def get_issue_comments(self, repo: str, issue_number: int):
-        return self._paginated_get(f"/repos/{repo}/issues/{issue_number}/comments", {})
+    def get_issue_comments(
+        self, repo: str, issue_number: int, max_pages: int = 20, allow_partial: bool = False
+    ):
+        path = f"/repos/{repo}/issues/{issue_number}/comments"
+        if allow_partial:
+            comments, _ = self._paginated_partial(path, {}, max_pages=max_pages)
+            return comments
+        return self._paginated_get(path, {}, max_pages=max_pages)
 
     def list_repo_comments(self, repo: str, since: str):
         return self._paginated_get(f"/repos/{repo}/issues/comments", {"since": since})
+
+    def iter_repo_comment_pages(self, repo: str, since: str, max_pages: int = 20):
+        return self._paginated_iter(f"/repos/{repo}/issues/comments", {"since": since}, max_pages=max_pages)
 
     def list_pull_requests(self, repo: str, state: str = "open"):
         return self._paginated_get(f"/repos/{repo}/pulls", {"state": state})

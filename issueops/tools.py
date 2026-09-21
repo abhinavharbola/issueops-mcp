@@ -9,8 +9,8 @@ from datetime import datetime, timedelta, timezone
 from psycopg.types.json import Jsonb
 
 from issueops.db import sync_connection
-from issueops.github_client import GitHubReadClient
-from issueops.heuristics import is_heuristically_flagged
+from issueops.github_client import GitHubReadClient, PaginationLimitExceededError
+from issueops.heuristics import flag_matches, is_heuristically_flagged
 
 VALID_CLOSE_REASONS = {"completed", "not_planned", None}
 
@@ -57,6 +57,12 @@ class ValidationError(Exception):
     pass
 
 
+class QueueFullError(ValidationError):
+    def __init__(self, message: str, scope: str):
+        self.scope = scope
+        super().__init__(message)
+
+
 def _now_ts() -> float:
     return time.monotonic()
 
@@ -74,9 +80,17 @@ def _pending_limit(name: str, default: int) -> int:
     return value
 
 
+def normalize_repo(repo: str) -> str:
+    return repo.strip().lower()
+
+
 def issue_plaintext(issue: dict) -> str:
-    comments_text = " ".join(c.get("body", "") for c in issue.get("comments_detail", []))
-    return f"{issue.get('title', '')} {issue.get('body') or ''} {comments_text}"
+    comments_text = " ".join((c.get("body") or "") for c in issue.get("comments_detail") or [])
+    return f"{issue.get('title') or ''} {issue.get('body') or ''} {comments_text}"
+
+
+def _issue_label_names(issue: dict) -> list[str]:
+    return [l["name"] if isinstance(l, dict) else l for l in issue.get("labels") or []]
 
 
 def check_repo_active(conn, repo: str) -> bool:
@@ -151,6 +165,7 @@ def _run_read_tool(dsn, tool_name, repo, issue_number, arguments, initiator, fn)
 
 
 def list_issues(dsn, read_client: GitHubReadClient, repo, initiator, state="open", labels=None, since=None, max_pages=20):
+    repo = normalize_repo(repo)
     arguments = {"state": state, "labels": labels, "since": since}
     return _run_read_tool(
         dsn, "list_issues", repo, None, arguments, initiator,
@@ -158,7 +173,43 @@ def list_issues(dsn, read_client: GitHubReadClient, repo, initiator, state="open
     )
 
 
+def list_issue_candidates(
+    dsn, read_client: GitHubReadClient, repo, initiator, state="open", since=None,
+    max_pages=20, limit=None, exclude=None, unchanged=None,
+):
+    repo = normalize_repo(repo)
+    excluded = exclude or set()
+    unchanged_hashes = unchanged or {}
+    arguments = {"state": state, "since": since, "max_pages": max_pages, "limit": limit}
+
+    def collect():
+        issues = []
+        skipped = 0
+        try:
+            for page in read_client.iter_issue_pages(repo, state=state, since=since, max_pages=max_pages):
+                for issue in page:
+                    if "pull_request" in issue:
+                        continue
+                    number = issue.get("number")
+                    if number in excluded:
+                        skipped += 1
+                        continue
+                    known_hash = unchanged_hashes.get(number)
+                    if known_hash is not None and known_hash == content_hash(issue.get("title"), issue.get("body")):
+                        skipped += 1
+                        continue
+                    issues.append(issue)
+                    if limit is not None and len(issues) >= limit:
+                        return {"issues": issues, "truncated": False, "skipped": skipped}
+        except PaginationLimitExceededError:
+            return {"issues": issues, "truncated": True, "skipped": skipped}
+        return {"issues": issues, "truncated": False, "skipped": skipped}
+
+    return _run_read_tool(dsn, "list_issues", repo, None, arguments, initiator, collect)
+
+
 def get_issue(dsn, read_client: GitHubReadClient, repo, issue_number, initiator, include_comments=True):
+    repo = normalize_repo(repo)
     return _run_read_tool(
         dsn, "get_issue", repo, issue_number, {}, initiator,
         lambda: read_client.get_issue(repo, issue_number, include_comments=include_comments),
@@ -166,6 +217,7 @@ def get_issue(dsn, read_client: GitHubReadClient, repo, issue_number, initiator,
 
 
 def list_pull_requests(dsn, read_client: GitHubReadClient, repo, initiator, state="open"):
+    repo = normalize_repo(repo)
     arguments = {"state": state}
     return _run_read_tool(
         dsn, "list_pull_requests", repo, None, arguments, initiator,
@@ -174,6 +226,7 @@ def list_pull_requests(dsn, read_client: GitHubReadClient, repo, initiator, stat
 
 
 def search_issues(dsn, read_client: GitHubReadClient, repo, query, initiator):
+    repo = normalize_repo(repo)
     arguments = {"query": query}
 
     def run():
@@ -192,7 +245,18 @@ def _issue_number_from_url(url: str) -> int | None:
     return int(tail) if tail.isdigit() else None
 
 
+def _drain_pages(pages):
+    items = []
+    try:
+        for page in pages:
+            items.extend(page)
+    except PaginationLimitExceededError:
+        return items, True
+    return items, False
+
+
 def get_repo_activity_summary(dsn, read_client: GitHubReadClient, repo, days, initiator):
+    repo = normalize_repo(repo)
     arguments = {"days": days}
 
     def compute():
@@ -200,7 +264,7 @@ def get_repo_activity_summary(dsn, read_client: GitHubReadClient, repo, days, in
             raise ValidationError(f"days must be an integer between 1 and {MAX_ACTIVITY_WINDOW_DAYS}")
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         since = cutoff.isoformat()
-        issues = read_client.list_issues(repo, state="all", since=since)
+        issues, issues_truncated = _drain_pages(read_client.iter_issue_pages(repo, state="all", since=since))
         opened = 0
         closed = 0
         by_label: dict[str, int] = {}
@@ -222,7 +286,8 @@ def get_repo_activity_summary(dsn, read_client: GitHubReadClient, repo, days, in
                     closed += 1
 
         commented_numbers = set()
-        for comment in read_client.list_repo_comments(repo, since):
+        comments, comments_truncated = _drain_pages(read_client.iter_repo_comment_pages(repo, since))
+        for comment in comments:
             created_at = datetime.fromisoformat(comment["created_at"].replace("Z", "+00:00"))
             if created_at < cutoff:
                 continue
@@ -230,12 +295,19 @@ def get_repo_activity_summary(dsn, read_client: GitHubReadClient, repo, days, in
             if number in issue_numbers:
                 commented_numbers.add(number)
 
-        return {
+        result = {
             "opened": opened,
             "closed": closed,
             "commented": len(commented_numbers),
             "by_label": by_label,
         }
+        if issues_truncated or comments_truncated:
+            result["truncated"] = True
+            result["note"] = (
+                "the page limit was reached before every matching item was read, "
+                "so these counts are lower bounds"
+            )
+        return result
 
     return _run_read_tool(dsn, "get_repo_activity_summary", repo, None, arguments, initiator, compute)
 
@@ -255,14 +327,15 @@ def _get_repo_assignable_logins(read_client: GitHubReadClient, repo: str, force_
 
 
 def get_repo_label_names(read_client: GitHubReadClient, repo: str) -> list[str]:
-    return list(_get_repo_label_names(read_client, repo))
+    return list(_get_repo_label_names(read_client, normalize_repo(repo)))
 
 
 def get_repo_assignable_logins(read_client: GitHubReadClient, repo: str) -> list[str]:
-    return list(_get_repo_assignable_logins(read_client, repo))
+    return list(_get_repo_assignable_logins(read_client, normalize_repo(repo)))
 
 
 def list_handled_issue_numbers(dsn, repo: str) -> set[int]:
+    repo = normalize_repo(repo)
     with sync_connection(dsn) as conn:
         rows = conn.execute(
             """
@@ -273,6 +346,48 @@ def list_handled_issue_numbers(dsn, repo: str) -> set[int]:
             (repo, "agent:%"),
         ).fetchall()
     return {row["issue_number"] for row in rows}
+
+
+DEFAULT_MAX_ERROR_ATTEMPTS = 3
+TRIAGE_OUTCOMES = ("proposed", "no_action", "error")
+
+
+def list_triage_skips(dsn, repo: str, max_error_attempts: int = DEFAULT_MAX_ERROR_ATTEMPTS) -> dict[int, str]:
+    repo = normalize_repo(repo)
+    with sync_connection(dsn) as conn:
+        rows = conn.execute(
+            """
+            SELECT issue_number, content_hash FROM triage_attempts
+            WHERE repo = %s AND (outcome = 'no_action' OR (outcome = 'error' AND attempts >= %s))
+            """,
+            (repo, max_error_attempts),
+        ).fetchall()
+    return {row["issue_number"]: row["content_hash"] for row in rows}
+
+
+def record_triage_attempt(dsn, repo: str, issue_number: int, digest: str, outcome: str, error: str | None = None):
+    if outcome not in TRIAGE_OUTCOMES:
+        raise ValueError(f"outcome must be one of {TRIAGE_OUTCOMES}, got {outcome!r}")
+    repo = normalize_repo(repo)
+    with sync_connection(dsn) as conn:
+        conn.execute(
+            """
+            INSERT INTO triage_attempts (repo, issue_number, content_hash, outcome, attempts, last_error, updated_at)
+            VALUES (%s, %s, %s, %s, 1, %s, now())
+            ON CONFLICT (repo, issue_number) DO UPDATE SET
+                attempts = CASE
+                    WHEN triage_attempts.content_hash = EXCLUDED.content_hash
+                         AND triage_attempts.outcome = 'error' AND EXCLUDED.outcome = 'error'
+                    THEN triage_attempts.attempts + 1
+                    ELSE 1
+                END,
+                content_hash = EXCLUDED.content_hash,
+                outcome = EXCLUDED.outcome,
+                last_error = EXCLUDED.last_error,
+                updated_at = now()
+            """,
+            (repo, issue_number, digest, outcome, error),
+        )
 
 
 def _normalize_arguments(arguments: dict) -> str:
@@ -294,6 +409,40 @@ def _find_existing_pending(conn, repo, issue_number, tool_name, arguments: dict)
     return None
 
 
+EXCERPT_TITLE_CHARS = 300
+EXCERPT_BODY_CHARS = 4000
+EXCERPT_COMMENT_CHARS = 1000
+EXCERPT_MAX_COMMENTS = 10
+RATIONALE_MAX_CHARS = 2000
+LOCK_NAMESPACE_INITIATOR = 1
+LOCK_NAMESPACE_ISSUE = 2
+
+
+def _clip(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}[truncated {len(text) - limit} chars]"
+
+
+def build_source_excerpt(issue: dict) -> dict:
+    comments = issue.get("comments_detail") or []
+    recent = comments[-EXCERPT_MAX_COMMENTS:]
+    return {
+        "title": _clip(issue.get("title") or "", EXCERPT_TITLE_CHARS),
+        "body": _clip(issue.get("body") or "", EXCERPT_BODY_CHARS),
+        "comments": [
+            {
+                "author": (c.get("user") or {}).get("login") or "unknown",
+                "body": _clip(c.get("body") or "", EXCERPT_COMMENT_CHARS),
+            }
+            for c in recent
+        ],
+        "comments_omitted": len(comments) - len(recent),
+        "comments_truncated_by_fetcher": bool(issue.get("comments_truncated")),
+        "flag_matches": flag_matches(issue_plaintext(issue)),
+    }
+
+
 def content_hash(title: str | None, body: str | None) -> str:
     return hashlib.sha256(f"{title or ''}\n{body or ''}".encode("utf-8")).hexdigest()
 
@@ -301,8 +450,8 @@ def content_hash(title: str | None, body: str | None) -> str:
 def _snapshot_from_issue(issue: dict) -> dict:
     return {
         "state": issue["state"],
-        "labels": sorted(l["name"] if isinstance(l, dict) else l for l in issue.get("labels", [])),
-        "assignees": sorted(a["login"] for a in issue.get("assignees", [])),
+        "labels": sorted(_issue_label_names(issue)),
+        "assignees": sorted(a["login"] for a in issue.get("assignees") or []),
         "content_hash": content_hash(issue.get("title"), issue.get("body")),
     }
 
@@ -324,9 +473,10 @@ def _enforce_pending_caps(conn, repo: str, issue_number: int, initiator: str):
         (repo, issue_number),
     ).fetchone()
     if issue_row["n"] >= per_issue_limit:
-        raise ValidationError(
+        raise QueueFullError(
             f"{repo}#{issue_number} already has {issue_row['n']} pending actions (limit {per_issue_limit}); "
-            "resolve some before proposing more"
+            "resolve some before proposing more",
+            "issue",
         )
 
     initiator_row = conn.execute(
@@ -337,9 +487,10 @@ def _enforce_pending_caps(conn, repo: str, issue_number: int, initiator: str):
         (initiator,),
     ).fetchone()
     if initiator_row["n"] >= per_initiator_limit:
-        raise ValidationError(
+        raise QueueFullError(
             f"{initiator} already has {initiator_row['n']} pending actions (limit {per_initiator_limit}); "
-            "a human needs to work through the queue first"
+            "a human needs to work through the queue first",
+            "initiator",
         )
 
 
@@ -363,6 +514,8 @@ def _queue_proposal(
     heuristic_flagged: bool,
     validate_fn=None,
     prefetched_issue: dict | None = None,
+    state_check=None,
+    rationale: str | None = None,
 ) -> tuple[str, str, bool]:
     start = _now_ts()
     with sync_connection(dsn) as conn:
@@ -370,7 +523,9 @@ def _queue_proposal(
             _require_active_repo(conn, repo)
 
             if validate_fn is not None:
-                validate_fn()
+                validated = validate_fn()
+                if validated is not None:
+                    arguments = validated
 
             existing_id = _find_existing_pending(conn, repo, issue_number, tool_name, arguments)
             if existing_id:
@@ -379,14 +534,22 @@ def _queue_proposal(
             _enforce_pending_caps(conn, repo, issue_number, initiator)
 
             snapshot_issue = prefetched_issue if prefetched_issue is not None else read_client.get_issue(repo, issue_number)
+            if state_check is not None:
+                state_check(snapshot_issue, arguments)
             snapshot = _snapshot_from_issue(snapshot_issue)
-            heuristic_flagged = heuristic_flagged or is_heuristically_flagged(
-                issue_plaintext(snapshot_issue)
-            )
+            excerpt = build_source_excerpt(snapshot_issue)
+            heuristic_flagged = heuristic_flagged or bool(excerpt["flag_matches"])
+            stored_rationale = _clip(rationale, RATIONALE_MAX_CHARS) if rationale else None
 
             with conn.transaction():
-                lock_key = f"{repo}:{issue_number}:{tool_name}"
-                conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (lock_key,))
+                conn.execute(
+                    "SELECT pg_advisory_xact_lock(%s, hashtext(%s))",
+                    (LOCK_NAMESPACE_INITIATOR, initiator),
+                )
+                conn.execute(
+                    "SELECT pg_advisory_xact_lock(%s, hashtext(%s))",
+                    (LOCK_NAMESPACE_ISSUE, f"{repo}:{issue_number}"),
+                )
 
                 existing_id = _find_existing_pending(conn, repo, issue_number, tool_name, arguments)
                 if existing_id:
@@ -398,13 +561,14 @@ def _queue_proposal(
                     """
                     INSERT INTO pending_actions
                         (tool_name, repo, issue_number, arguments, issue_state_snapshot,
-                         heuristic_flagged, requested_by)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                         heuristic_flagged, requested_by, source_excerpt, rationale)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING id
                     """,
                     (
                         tool_name, repo, issue_number, Jsonb(arguments),
                         Jsonb(snapshot), heuristic_flagged, initiator,
+                        Jsonb(excerpt), stored_rationale,
                     ),
                 ).fetchone()
                 new_id = row["id"]
@@ -430,7 +594,9 @@ def _queue_proposal(
 def propose_add_comment(
     dsn, read_client, repo, issue_number, body, initiator, heuristic_flagged=False,
     max_body_chars: int = DEFAULT_COMMENT_BODY_MAX_CHARS, issue: dict | None = None,
+    rationale: str | None = None,
 ):
+    repo = normalize_repo(repo)
     body = body.strip()
 
     def validate():
@@ -442,69 +608,122 @@ def propose_add_comment(
     arguments = {"body": body}
     action_id, preview, _ = _queue_proposal(
         dsn, read_client, "propose_add_comment", repo, issue_number, arguments, initiator, heuristic_flagged,
-        validate_fn=validate, prefetched_issue=issue,
+        validate_fn=validate, prefetched_issue=issue, rationale=rationale,
     )
     return {"id": action_id, "preview": f"Add comment on {repo}#{issue_number}: {preview}"}
 
 
-def _validate_known_labels(read_client, repo, labels):
+def _resolve_known_labels(read_client, repo, labels) -> list[str]:
     if not labels:
         raise ValidationError("labels cannot be empty")
-    valid_labels = set(_get_repo_label_names(read_client, repo))
-    unknown = [l for l in labels if l not in valid_labels]
+
+    def resolve(names):
+        by_lower = {name.lower(): name for name in names}
+        resolved = []
+        unknown = []
+        for label in labels:
+            canonical = by_lower.get(str(label).lower())
+            if canonical is None:
+                unknown.append(label)
+            elif canonical not in resolved:
+                resolved.append(canonical)
+        return resolved, unknown
+
+    resolved, unknown = resolve(_get_repo_label_names(read_client, repo))
     if unknown:
-        valid_labels = set(_get_repo_label_names(read_client, repo, force_refresh=True))
-        unknown = [l for l in labels if l not in valid_labels]
+        resolved, unknown = resolve(_get_repo_label_names(read_client, repo, force_refresh=True))
         if unknown:
             raise ValidationError(f"unknown labels for {repo}: {unknown}")
+    return resolved
 
 
-def propose_add_labels(dsn, read_client, repo, issue_number, labels, initiator, heuristic_flagged=False, issue: dict | None = None):
+def _check_add_labels_state(issue: dict, arguments: dict):
+    present = {name.lower() for name in _issue_label_names(issue)}
+    if all(label.lower() in present for label in arguments["labels"]):
+        raise ValidationError("all requested labels are already on the issue")
+
+
+def _check_remove_labels_state(issue: dict, arguments: dict):
+    present = {name.lower() for name in _issue_label_names(issue)}
+    missing = [label for label in arguments["labels"] if label.lower() not in present]
+    if missing:
+        raise ValidationError(f"labels are not on the issue: {missing}")
+
+
+def _check_assign_state(issue: dict, arguments: dict):
+    assigned = {(a.get("login") or "").lower() for a in issue.get("assignees") or []}
+    if arguments["assignee"].lower() in assigned:
+        raise ValidationError(f"{arguments['assignee']} is already assigned to the issue")
+
+
+def _check_close_state(issue: dict, arguments: dict):
+    if issue.get("state") != "open":
+        raise ValidationError("the issue is not open, so there is nothing to close")
+
+
+def _propose_labels(
+    tool_name, verb, state_check, dsn, read_client, repo, issue_number, labels, initiator,
+    heuristic_flagged, issue, rationale=None,
+):
+    repo = normalize_repo(repo)
+    resolved = {}
+
     def validate():
-        _validate_known_labels(read_client, repo, labels)
+        resolved["labels"] = sorted(_resolve_known_labels(read_client, repo, labels))
+        return {"labels": resolved["labels"]}
 
-    arguments = {"labels": sorted(labels)}
     action_id, preview, _ = _queue_proposal(
-        dsn, read_client, "propose_add_labels", repo, issue_number, arguments, initiator, heuristic_flagged,
-        validate_fn=validate, prefetched_issue=issue,
+        dsn, read_client, tool_name, repo, issue_number, {"labels": sorted(labels or [])}, initiator,
+        heuristic_flagged, validate_fn=validate, prefetched_issue=issue, state_check=state_check,
+        rationale=rationale,
     )
-    return {"id": action_id, "preview": f"Add labels {labels} on {repo}#{issue_number}: {preview}"}
+    shown = resolved.get("labels", labels)
+    return {"id": action_id, "preview": f"{verb} labels {shown} on {repo}#{issue_number}: {preview}"}
 
 
-def propose_remove_labels(dsn, read_client, repo, issue_number, labels, initiator, heuristic_flagged=False, issue: dict | None = None):
-    def validate():
-        _validate_known_labels(read_client, repo, labels)
-
-    arguments = {"labels": sorted(labels)}
-    action_id, preview, _ = _queue_proposal(
-        dsn, read_client, "propose_remove_labels", repo, issue_number, arguments, initiator, heuristic_flagged,
-        validate_fn=validate, prefetched_issue=issue,
+def propose_add_labels(dsn, read_client, repo, issue_number, labels, initiator, heuristic_flagged=False, issue: dict | None = None, rationale: str | None = None):
+    return _propose_labels(
+        "propose_add_labels", "Add", _check_add_labels_state, dsn, read_client, repo, issue_number,
+        labels, initiator, heuristic_flagged, issue, rationale,
     )
-    return {"id": action_id, "preview": f"Remove labels {labels} on {repo}#{issue_number}: {preview}"}
 
 
-def propose_assign(dsn, read_client, repo, issue_number, assignee, initiator, heuristic_flagged=False, issue: dict | None = None):
+def propose_remove_labels(dsn, read_client, repo, issue_number, labels, initiator, heuristic_flagged=False, issue: dict | None = None, rationale: str | None = None):
+    return _propose_labels(
+        "propose_remove_labels", "Remove", _check_remove_labels_state, dsn, read_client, repo,
+        issue_number, labels, initiator, heuristic_flagged, issue, rationale,
+    )
+
+
+def propose_assign(dsn, read_client, repo, issue_number, assignee, initiator, heuristic_flagged=False, issue: dict | None = None, rationale: str | None = None):
+    repo = normalize_repo(repo)
+    resolved = {}
+
     def validate():
         if not assignee or not assignee.strip():
             raise ValidationError("assignee cannot be empty")
         if len(assignee) > 39 or not _GITHUB_LOGIN.match(assignee):
             raise ValidationError(f"{assignee} is not a syntactically valid GitHub login")
         wanted = assignee.lower()
-        logins = {l.lower() for l in _get_repo_assignable_logins(read_client, repo)}
+        logins = {l.lower(): l for l in _get_repo_assignable_logins(read_client, repo)}
         if wanted not in logins:
-            logins = {l.lower() for l in _get_repo_assignable_logins(read_client, repo, force_refresh=True)}
+            logins = {l.lower(): l for l in _get_repo_assignable_logins(read_client, repo, force_refresh=True)}
             if wanted not in logins:
                 raise ValidationError(f"{assignee} is not an assignable user in {repo}")
+        resolved["assignee"] = logins[wanted]
+        return {"assignee": logins[wanted]}
 
-    arguments = {"assignee": assignee}
     action_id, preview, _ = _queue_proposal(
-        dsn, read_client, "propose_assign", repo, issue_number, arguments, initiator, heuristic_flagged,
-        validate_fn=validate, prefetched_issue=issue,
+        dsn, read_client, "propose_assign", repo, issue_number, {"assignee": assignee}, initiator,
+        heuristic_flagged, validate_fn=validate, prefetched_issue=issue, state_check=_check_assign_state,
+        rationale=rationale,
     )
-    return {"id": action_id, "preview": f"Assign {assignee} on {repo}#{issue_number}: {preview}"}
+    return {"id": action_id, "preview": f"Assign {resolved.get('assignee', assignee)} on {repo}#{issue_number}: {preview}"}
 
 
-def propose_close(dsn, read_client, repo, issue_number, reason, initiator, heuristic_flagged=False, issue: dict | None = None):
+def propose_close(dsn, read_client, repo, issue_number, reason, initiator, heuristic_flagged=False, issue: dict | None = None, rationale: str | None = None):
+    repo = normalize_repo(repo)
+
     def validate():
         if reason not in VALID_CLOSE_REASONS:
             raise ValidationError(f"reason must be one of {sorted(r for r in VALID_CLOSE_REASONS if r)} or omitted")
@@ -512,6 +731,7 @@ def propose_close(dsn, read_client, repo, issue_number, reason, initiator, heuri
     arguments = {"reason": reason}
     action_id, preview, _ = _queue_proposal(
         dsn, read_client, "propose_close", repo, issue_number, arguments, initiator, heuristic_flagged,
-        validate_fn=validate, prefetched_issue=issue,
+        validate_fn=validate, prefetched_issue=issue, state_check=_check_close_state,
+        rationale=rationale,
     )
     return {"id": action_id, "preview": f"Close {repo}#{issue_number}: {preview}"}

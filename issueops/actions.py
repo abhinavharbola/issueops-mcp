@@ -1,41 +1,112 @@
+import time
 from datetime import timedelta
 
+import psycopg
 import requests
 
 from issueops import tools
-from issueops.github_client import GitHubReadClient, GitHubWriteClient
+from issueops.db import sync_connection
+from issueops.github_client import GitHubAPIError, GitHubReadClient, GitHubWriteClient
 
 DEFAULT_PENDING_ACTION_TTL_HOURS = 48
 DEFAULT_STUCK_APPROVING_RECOVERY_MINUTES = 10
+PERMANENT_READ_FAILURE_STATUSES = {404, 410}
+RECORD_ATTEMPTS = 3
+RECORD_RETRY_DELAY_SECONDS = 0.5
+
+
+class RecordingFailedError(Exception):
+    pass
+
+
+def _is_permanent_read_failure(exc: Exception) -> bool:
+    return isinstance(exc, GitHubAPIError) and exc.status_code in PERMANENT_READ_FAILURE_STATUSES
+
+
+def _record_with_retry(conn, dsn, operation):
+    last_exc = None
+    for attempt in range(RECORD_ATTEMPTS):
+        try:
+            if attempt == 0 or dsn is None:
+                return operation(conn, attempt)
+            with sync_connection(dsn) as fresh:
+                return operation(fresh, attempt)
+        except psycopg.Error as exc:
+            last_exc = exc
+            if attempt < RECORD_ATTEMPTS - 1:
+                time.sleep(RECORD_RETRY_DELAY_SECONDS * (attempt + 1))
+    raise RecordingFailedError(str(last_exc)) from last_exc
+
+
+def _audit_with_retry(conn, dsn, *audit_args) -> bool:
+    try:
+        _record_with_retry(conn, dsn, lambda c, attempt: tools.write_audit_log(c, *audit_args))
+    except RecordingFailedError:
+        return False
+    return True
+
+
+def _already_recorded(conn, action_id: str, lease: object, status: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM pending_actions WHERE id = %s AND status = %s AND claimed_at = %s",
+        (action_id, status, lease),
+    ).fetchone()
+    return row is not None
+
+
+def _finish_recorded(conn, dsn, action_id, lease, set_sql, set_params, audit_args, target_status) -> bool:
+    def operation(c, attempt):
+        if _finish_with_lease(c, action_id, lease, set_sql, set_params, audit_args):
+            return True
+        return attempt > 0 and _already_recorded(c, action_id, lease, target_status)
+
+    return _record_with_retry(conn, dsn, operation)
 
 
 def expire_stale_pending(conn, ttl_hours: int = DEFAULT_PENDING_ACTION_TTL_HOURS):
-    conn.execute(
-        """
-        UPDATE pending_actions
-        SET status = 'expired'
-        WHERE status = 'pending' AND created_at < now() - (%s * interval '1 hour')
-        """,
-        (ttl_hours,),
-    )
+    with conn.transaction():
+        rows = conn.execute(
+            """
+            UPDATE pending_actions
+            SET status = 'expired'
+            WHERE status = 'pending' AND created_at < now() - (%s * interval '1 hour')
+            RETURNING id, tool_name, repo, issue_number, arguments
+            """,
+            (ttl_hours,),
+        ).fetchall()
+        for row in rows:
+            tools.write_audit_log(
+                conn, row["tool_name"], row["repo"], row["issue_number"], row["arguments"],
+                row["id"], "system:expiry", "expired", f"pending longer than {ttl_hours} hours", 0,
+            )
+    return rows
 
 
 def recover_stuck_approving(conn, minutes: int = DEFAULT_STUCK_APPROVING_RECOVERY_MINUTES):
-    rows = conn.execute(
-        """
-        UPDATE pending_actions
-        SET status = 'pending', claimed_at = NULL
-        WHERE status = 'approving' AND claimed_at < now() - (%s * interval '1 minute')
-        RETURNING id, tool_name, repo, issue_number, arguments
-        """,
-        (minutes,),
-    ).fetchall()
-    for row in rows:
-        tools.write_audit_log(
-            conn, row["tool_name"], row["repo"], row["issue_number"], row["arguments"],
-            row["id"], "system:recovery", "recovered",
-            "reset from a stuck approving state back to pending", 0,
-        )
+    with conn.transaction():
+        rows = conn.execute(
+            """
+            WITH stuck AS (
+                SELECT id, claimed_by FROM pending_actions
+                WHERE status = 'approving' AND claimed_at < now() - (%s * interval '1 minute')
+                FOR UPDATE
+            )
+            UPDATE pending_actions p
+            SET status = 'pending', claimed_at = NULL, claimed_by = NULL
+            FROM stuck
+            WHERE p.id = stuck.id
+            RETURNING p.id, p.tool_name, p.repo, p.issue_number, p.arguments, stuck.claimed_by AS previous_claimant
+            """,
+            (minutes,),
+        ).fetchall()
+        for row in rows:
+            tools.write_audit_log(
+                conn, row["tool_name"], row["repo"], row["issue_number"], row["arguments"],
+                row["id"], "system:recovery", "recovered",
+                f"reset from a stuck approving state back to pending; the approval had been started by "
+                f"{row.get('previous_claimant') or 'an unknown approver'}",
+                0,
+            )
     return rows
 
 
@@ -95,8 +166,8 @@ def _stale_reason(tool_name: str, arguments: dict, then: dict, now: dict) -> str
     if tool_name == "propose_close" and now.get("state") != "open":
         return "issue is no longer open"
     if tool_name == "propose_remove_labels":
-        present = set(now.get("labels", []))
-        missing = [label for label in arguments["labels"] if label not in present]
+        present = {label.lower() for label in now.get("labels") or []}
+        missing = [label for label in arguments["labels"] if label.lower() not in present]
         if missing:
             return f"labels are no longer on the issue: {missing}"
     return None
@@ -124,9 +195,14 @@ def _claim_pending_action(conn, action_id: str, approver: str, ttl_hours: int):
             return None, None, {"status": "blocked"}
 
         claim_row = conn.execute(
-            "UPDATE pending_actions SET status = 'approving', claimed_at = now() WHERE id = %s RETURNING claimed_at",
-            (action_id,),
+            "UPDATE pending_actions SET status = 'approving', claimed_at = now(), claimed_by = %s "
+            "WHERE id = %s RETURNING claimed_at",
+            (approver, action_id),
         ).fetchone()
+        tools.write_audit_log(
+            conn, tool_name, repo, issue_number, arguments, action_id, approver, "claimed",
+            "approval started", 0,
+        )
         return row, claim_row["claimed_at"], None
 
 
@@ -138,19 +214,25 @@ def _lease_is_still_held(conn, action_id: str, lease: object) -> bool:
     return row is not None
 
 
-def _finish_with_lease(conn, action_id: str, lease: object, set_sql: str, set_params: tuple = ()) -> bool:
+def _finish_with_lease(
+    conn, action_id: str, lease: object, set_sql: str, set_params: tuple = (), audit_args: tuple | None = None,
+) -> bool:
     with conn.transaction():
         row = conn.execute(
             f"UPDATE pending_actions {set_sql} WHERE id = %s AND status = 'approving' AND claimed_at = %s RETURNING id",
             set_params + (action_id, lease),
         ).fetchone()
-        return row is not None
+        if row is None:
+            return False
+        if audit_args is not None:
+            tools.write_audit_log(conn, *audit_args)
+        return True
 
 
 def _finish_before_github_call(conn, tool_name, repo, issue_number, arguments, action_id, approver, lease, set_sql, set_params, status, summary):
-    if _finish_with_lease(conn, action_id, lease, set_sql, set_params):
-        tools.write_audit_log(conn, tool_name, repo, issue_number, arguments, action_id, approver, status, summary, 0)
-        return {"status": status, **({"error": summary} if status in ("failed", "stale") else {})}
+    audit_args = (tool_name, repo, issue_number, arguments, action_id, approver, status, summary, 0)
+    if _finish_with_lease(conn, action_id, lease, set_sql, set_params, audit_args):
+        return {"status": status, **({"error": summary} if status in ("failed", "stale", "released") else {})}
 
     tools.write_audit_log(
         conn, tool_name, repo, issue_number, arguments, action_id, approver, "lost_lease",
@@ -161,7 +243,7 @@ def _finish_before_github_call(conn, tool_name, repo, issue_number, arguments, a
 
 def approve_action(
     conn, read_client: GitHubReadClient, write_client: GitHubWriteClient, action_id: str, approver: str,
-    ttl_hours: int = DEFAULT_PENDING_ACTION_TTL_HOURS,
+    ttl_hours: int = DEFAULT_PENDING_ACTION_TTL_HOURS, dsn: str | None = None,
 ):
     row, lease, early_result = _claim_pending_action(conn, action_id, approver, ttl_hours)
     if early_result is not None:
@@ -172,12 +254,23 @@ def approve_action(
     try:
         current_snapshot = tools.snapshot_issue_state(read_client, repo, issue_number)
         existing_comments = (
-            read_client.get_issue_comments(repo, issue_number) if tool_name == "propose_add_comment" else []
+            read_client.get_issue_comments(repo, issue_number, allow_partial=True)
+            if tool_name == "propose_add_comment" else []
+        )
+        current_repo_labels = (
+            {label["name"].lower() for label in read_client.get_repo_labels(repo)}
+            if tool_name == "propose_add_labels" else None
         )
     except Exception as exc:
+        message = str(exc)
+        if _is_permanent_read_failure(exc):
+            return _finish_before_github_call(
+                conn, tool_name, repo, issue_number, arguments, action_id, approver, lease,
+                "SET status = 'failed', failure_reason = %s", (message,), "failed", message,
+            )
         return _finish_before_github_call(
             conn, tool_name, repo, issue_number, arguments, action_id, approver, lease,
-            "SET status = 'failed', failure_reason = %s", (str(exc),), "failed", str(exc),
+            "SET status = 'pending', claimed_at = NULL, claimed_by = NULL", (), "released", message,
         )
 
     if not _lease_is_still_held(conn, action_id, lease):
@@ -192,6 +285,10 @@ def approve_action(
         wanted = arguments["body"].strip()
         if any((comment.get("body") or "").strip() == wanted for comment in existing_comments):
             stale_reason = "an identical comment already exists on the issue"
+    if stale_reason is None and current_repo_labels is not None:
+        missing = [label for label in arguments["labels"] if label.lower() not in current_repo_labels]
+        if missing:
+            stale_reason = f"labels no longer exist on the repo and GitHub would recreate them: {missing}"
     if stale_reason is not None:
         return _finish_before_github_call(
             conn, tool_name, repo, issue_number, arguments, action_id, approver, lease,
@@ -207,33 +304,54 @@ def approve_action(
             if outcome_unknown
             else str(exc)
         )
-        if _finish_with_lease(conn, action_id, lease, "SET status = 'failed', failure_reason = %s", (message,)):
-            tools.write_audit_log(conn, tool_name, repo, issue_number, arguments, action_id, approver, "failed", message, 0)
+        try:
+            finished = _finish_recorded(
+                conn, dsn, action_id, lease, "SET status = 'failed', failure_reason = %s", (message,),
+                (tool_name, repo, issue_number, arguments, action_id, approver, "failed", message, 0),
+                "failed",
+            )
+        except RecordingFailedError as recording_error:
+            return {
+                "status": "recording_failed",
+                "error": f"{message}; the database write also failed: {recording_error}",
+                "github_call_succeeded": False,
+                "outcome_unknown": outcome_unknown,
+            }
+        if finished:
             result = {"status": "failed", "error": message}
             if outcome_unknown:
                 result["outcome_unknown"] = True
             return result
 
-        tools.write_audit_log(
-            conn, tool_name, repo, issue_number, arguments, action_id, approver, "lost_lease_after_execution",
+        _audit_with_retry(
+            conn, dsn, tool_name, repo, issue_number, arguments, action_id, approver,
+            "lost_lease_after_execution",
             f"the GitHub call raised ({message}) but the lease was lost before this could be recorded; "
             "check GitHub and the audit log for a possible duplicate or partial action", 0,
         )
         return {"status": "lost_lease_after_execution", "error": message}
 
-    updated = _finish_with_lease(
-        conn, action_id, lease,
-        "SET status = 'executed', approved_by = %s, approved_at = now(), executed_at = now()",
-        (approver,),
-    )
+    try:
+        updated = _finish_recorded(
+            conn, dsn, action_id, lease,
+            "SET status = 'executed', approved_by = %s, approved_at = now(), executed_at = now()", (approver,),
+            (tool_name, repo, issue_number, arguments, action_id, approver, "executed", None, 0),
+            "executed",
+        )
+    except RecordingFailedError as recording_error:
+        return {
+            "status": "recording_failed",
+            "error": str(recording_error),
+            "github_call_succeeded": True,
+        }
     if not updated:
-        tools.write_audit_log(
-            conn, tool_name, repo, issue_number, arguments, action_id, approver, "lost_lease_after_execution",
+        _audit_with_retry(
+            conn, dsn, tool_name, repo, issue_number, arguments, action_id, approver,
+            "lost_lease_after_execution",
             "the GitHub call succeeded but the lease was lost before this could be recorded; check GitHub and the audit log for a possible duplicate action", 0,
         )
         return {"status": "lost_lease_after_execution"}
 
-    tools.write_audit_log(conn, tool_name, repo, issue_number, arguments, action_id, approver, "executed", None, 0)
     return {"status": "executed"}
 
 
@@ -246,7 +364,7 @@ def reject_action(conn, action_id: str, approver: str, reason: str | None = None
             return {"status": "not_found_or_not_pending"}
 
         conn.execute(
-            "UPDATE pending_actions SET status = 'rejected', approved_by = %s, approved_at = now() WHERE id = %s",
+            "UPDATE pending_actions SET status = 'rejected', rejected_by = %s, rejected_at = now() WHERE id = %s",
             (approver, action_id),
         )
         tools.write_audit_log(

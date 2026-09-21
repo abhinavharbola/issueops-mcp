@@ -1,3 +1,6 @@
+import re
+import unicodedata
+
 HEURISTIC_PHRASES = [
     "ignore previous instructions",
     "ignore all previous instructions",
@@ -13,7 +16,20 @@ HEURISTIC_PHRASES = [
     "override your instructions",
 ]
 
+_INVISIBLE = re.compile("[\u200b\u200c\u200d\u2060\ufeff\u00ad]")
+_WHITESPACE = re.compile(r"\s+")
+
+
+def _normalize(text: str) -> str:
+    text = unicodedata.normalize("NFKC", text)
+    text = _INVISIBLE.sub("", text)
+    return _WHITESPACE.sub(" ", text).lower()
+
+
+def flag_matches(text: str) -> list[str]:
+    normalized = _normalize(text)
+    return [phrase for phrase in HEURISTIC_PHRASES if phrase in normalized]
+
 
 def is_heuristically_flagged(text: str) -> bool:
-    lowered = text.lower()
-    return any(phrase in lowered for phrase in HEURISTIC_PHRASES)
+    return bool(flag_matches(text))

@@ -111,6 +111,13 @@ def check_audit_consistency(dsn: str) -> dict:
         SELECT count(*) AS n
         FROM pending_actions p
         WHERE p.status = 'executed'
+          AND COALESCE(p.executed_at, p.approved_at) >= COALESCE(
+            (
+                SELECT max((w.arguments->>'before')::timestamptz) FROM audit_log w
+                WHERE w.tool_name = 'prune_audit_log' AND w.result_status = 'pruned'
+            ),
+            '-infinity'::timestamptz
+          )
           AND NOT EXISTS (
             SELECT 1 FROM audit_log a
             WHERE a.pending_action_id = p.id AND a.result_status = 'executed'

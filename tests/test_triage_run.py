@@ -1,6 +1,7 @@
 import json
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
 
 import agent.triage as triage
@@ -16,6 +17,12 @@ def _issue(number, title="t", body="b"):
         "labels": [],
         "assignees": [],
     }
+
+
+def _listing(monkeypatch, issues, truncated=False, skipped=0):
+    mock = MagicMock(return_value={"issues": issues, "truncated": truncated, "skipped": skipped})
+    monkeypatch.setattr(triage.tools, "list_issue_candidates", mock)
+    return mock
 
 
 def _classification(**overrides):
@@ -34,7 +41,7 @@ def _classification(**overrides):
 def patched(monkeypatch):
     monkeypatch.setattr(triage, "load_config", MagicMock(return_value=MagicMock(
         neon_dsn="dsn", github_read_pat="pat", logfire_token=None,
-        groq_api_key="k", groq_api_key_fallback=None,
+        groq_api_key="k", groq_api_key_fallback=None, comment_body_max_chars=65536,
     )))
     monkeypatch.setattr(triage, "configure_logfire", MagicMock())
     monkeypatch.setattr(triage, "GitHubReadClient", MagicMock())
@@ -42,16 +49,14 @@ def patched(monkeypatch):
     monkeypatch.setattr(triage.tools, "get_repo_label_names", MagicMock(return_value=["bug", "enhancement", "question"]))
     monkeypatch.setattr(triage.tools, "get_repo_assignable_logins", MagicMock(return_value=["octocat"]))
     monkeypatch.setattr(triage.tools, "list_handled_issue_numbers", MagicMock(return_value=set()))
-
-
-def test_run_triage_skips_pull_requests(monkeypatch, patched):
-    monkeypatch.setattr(triage.tools, "list_issues", MagicMock(return_value=[{"number": 1, "pull_request": {}}]))
-    results = triage.run_triage("owner/repo", "test")
-    assert results == []
+    monkeypatch.setattr(triage.tools, "list_triage_skips", MagicMock(return_value={}))
+    recorder = MagicMock()
+    monkeypatch.setattr(triage.tools, "record_triage_attempt", recorder)
+    return recorder
 
 
 def test_run_triage_records_an_error_when_an_issue_has_no_number(monkeypatch, patched):
-    monkeypatch.setattr(triage.tools, "list_issues", MagicMock(return_value=[{"title": "no number field"}]))
+    _listing(monkeypatch, [{"title": "no number field"}])
     results = triage.run_triage("owner/repo", "test")
     assert len(results) == 1
     assert results[0]["issue_number"] is None
@@ -60,7 +65,7 @@ def test_run_triage_records_an_error_when_an_issue_has_no_number(monkeypatch, pa
 
 def test_run_triage_calls_propose_add_labels_with_the_prefetched_issue(monkeypatch, patched):
     issue = _issue(1)
-    monkeypatch.setattr(triage.tools, "list_issues", MagicMock(return_value=[{"number": 1}]))
+    _listing(monkeypatch, [{"number": 1}])
     monkeypatch.setattr(triage.tools, "get_issue", MagicMock(return_value=issue))
     monkeypatch.setattr(triage, "classify_issue", MagicMock(return_value=_classification(labels_to_add=["bug"])))
 
@@ -70,12 +75,15 @@ def test_run_triage_calls_propose_add_labels_with_the_prefetched_issue(monkeypat
     results = triage.run_triage("owner/repo", "test")
 
     assert results[0]["proposals"][0]["result"]["id"] == "p1"
-    fake_propose.assert_called_once_with("dsn", triage.GitHubReadClient.return_value, "owner/repo", 1, {"labels": ["bug"]}, "test", False, issue)
+    fake_propose.assert_called_once_with(
+        "dsn", triage.GitHubReadClient.return_value, "owner/repo", 1, {"labels": ["bug"]}, "test", False, issue,
+        rationale="r", max_body_chars=65536,
+    )
 
 
 def test_run_triage_proposes_multiple_actions_for_one_issue(monkeypatch, patched):
     issue = _issue(1)
-    monkeypatch.setattr(triage.tools, "list_issues", MagicMock(return_value=[{"number": 1}]))
+    _listing(monkeypatch, [{"number": 1}])
     monkeypatch.setattr(triage.tools, "get_issue", MagicMock(return_value=issue))
     monkeypatch.setattr(triage, "classify_issue", MagicMock(return_value=_classification(labels_to_add=["bug"], comment="hi")))
 
@@ -93,11 +101,11 @@ def test_run_triage_proposes_multiple_actions_for_one_issue(monkeypatch, patched
 
 def test_run_triage_records_a_validation_error_without_aborting_the_issue(monkeypatch, patched):
     issue = _issue(1)
-    monkeypatch.setattr(triage.tools, "list_issues", MagicMock(return_value=[{"number": 1}]))
+    _listing(monkeypatch, [{"number": 1}])
     monkeypatch.setattr(triage.tools, "get_issue", MagicMock(return_value=issue))
     monkeypatch.setattr(triage, "classify_issue", MagicMock(return_value=_classification(close_reason="completed")))
 
-    def failing_propose_close(dsn, rc, repo, num, args, initiator, flagged, issue):
+    def failing_propose_close(dsn, rc, repo, num, args, initiator, flagged, issue, **kwargs):
         raise triage.tools.ValidationError("bad reason")
 
     monkeypatch.setitem(triage.PROPOSE_DISPATCH, "propose_close", failing_propose_close)
@@ -107,18 +115,19 @@ def test_run_triage_records_a_validation_error_without_aborting_the_issue(monkey
     assert results[0]["proposals"][0]["error"] == "bad reason"
 
 
-def test_run_triage_respects_max_issues(monkeypatch, patched):
-    monkeypatch.setattr(triage.tools, "list_issues", MagicMock(return_value=[{"number": 1}, {"number": 2}, {"number": 3}]))
+def test_run_triage_passes_max_issues_as_the_listing_limit(monkeypatch, patched):
+    listing = _listing(monkeypatch, [{"number": 1}, {"number": 2}])
     monkeypatch.setattr(triage.tools, "get_issue", MagicMock(side_effect=lambda *a, **k: _issue(a[3])))
     monkeypatch.setattr(triage, "classify_issue", MagicMock(return_value=_classification()))
 
     results = triage.run_triage("owner/repo", "test", max_issues=2)
 
     assert len(results) == 2
+    assert listing.call_args.kwargs["limit"] == 2
 
 
-def test_run_triage_skips_issues_that_already_have_a_handled_agent_proposal(monkeypatch, patched):
-    monkeypatch.setattr(triage.tools, "list_issues", MagicMock(return_value=[{"number": 1}, {"number": 2}]))
+def test_run_triage_excludes_issues_that_already_have_a_handled_agent_proposal(monkeypatch, patched):
+    listing = _listing(monkeypatch, [{"number": 2}], skipped=1)
     monkeypatch.setattr(triage.tools, "list_handled_issue_numbers", MagicMock(return_value={1}))
     get_issue = MagicMock(side_effect=lambda *a, **k: _issue(a[3]))
     monkeypatch.setattr(triage.tools, "get_issue", get_issue)
@@ -126,35 +135,43 @@ def test_run_triage_skips_issues_that_already_have_a_handled_agent_proposal(monk
 
     results = triage.run_triage("owner/repo", "test")
 
+    assert listing.call_args.kwargs["exclude"] == {1}
     assert [r["issue_number"] for r in results] == [2]
     assert get_issue.call_count == 1
 
 
-def test_run_triage_applies_max_issues_after_removing_handled_issues(monkeypatch, patched):
-    monkeypatch.setattr(triage.tools, "list_issues", MagicMock(return_value=[{"number": 1}, {"number": 2}, {"number": 3}]))
-    monkeypatch.setattr(triage.tools, "list_handled_issue_numbers", MagicMock(return_value={1}))
-    monkeypatch.setattr(triage.tools, "get_issue", MagicMock(side_effect=lambda *a, **k: _issue(a[3])))
-    monkeypatch.setattr(triage, "classify_issue", MagicMock(return_value=_classification()))
-
-    results = triage.run_triage("owner/repo", "test", max_issues=1)
-
-    assert [r["issue_number"] for r in results] == [2]
-
-
 def test_run_triage_passes_since_and_max_pages_to_the_issue_listing(monkeypatch, patched):
-    list_issues = MagicMock(return_value=[])
-    monkeypatch.setattr(triage.tools, "list_issues", list_issues)
+    listing = _listing(monkeypatch, [])
 
     triage.run_triage("owner/repo", "test", since="2026-01-01T00:00:00Z", max_pages=50)
 
-    kwargs = list_issues.call_args.kwargs
+    kwargs = listing.call_args.kwargs
     assert kwargs["since"] == "2026-01-01T00:00:00Z"
     assert kwargs["max_pages"] == 50
 
 
+def test_run_triage_keeps_going_with_partial_candidates_when_the_page_limit_is_hit(monkeypatch, patched, capsys):
+    _listing(monkeypatch, [{"number": 1}], truncated=True)
+    monkeypatch.setattr(triage.tools, "get_issue", MagicMock(return_value=_issue(1)))
+    monkeypatch.setattr(triage, "classify_issue", MagicMock(return_value=_classification()))
+
+    results = triage.run_triage("owner/repo", "test", max_pages=3)
+
+    assert [r["issue_number"] for r in results] == [1]
+    assert "stopped listing after 3 pages" in capsys.readouterr().err
+
+
+def test_run_triage_normalizes_the_repo_name(monkeypatch, patched):
+    listing = _listing(monkeypatch, [])
+
+    triage.run_triage("Owner/Repo", "test")
+
+    assert listing.call_args.args[2] == "owner/repo"
+
+
 def test_run_triage_gives_the_classifier_trusted_repo_context(monkeypatch, patched):
     issue = _issue(1)
-    monkeypatch.setattr(triage.tools, "list_issues", MagicMock(return_value=[{"number": 1}]))
+    _listing(monkeypatch, [{"number": 1}])
     monkeypatch.setattr(triage.tools, "get_issue", MagicMock(return_value=issue))
     classify = MagicMock(return_value=_classification())
     monkeypatch.setattr(triage, "classify_issue", classify)
@@ -171,7 +188,7 @@ def test_run_triage_continues_when_the_assignable_users_fetch_fails(monkeypatch,
         triage.tools, "get_repo_assignable_logins",
         MagicMock(side_effect=triage.GitHubAPIError(403, "forbidden")),
     )
-    monkeypatch.setattr(triage.tools, "list_issues", MagicMock(return_value=[{"number": 1}]))
+    _listing(monkeypatch, [{"number": 1}])
     monkeypatch.setattr(triage.tools, "get_issue", MagicMock(return_value=_issue(1)))
     classify = MagicMock(return_value=_classification())
     monkeypatch.setattr(triage, "classify_issue", classify)
@@ -187,6 +204,19 @@ def test_plan_drops_labels_already_on_the_issue():
     issue["labels"] = [{"name": "Bug"}]
     plan = triage._plan_from_classification(_classification(labels_to_add=["bug", "enhancement"]), "o/r", 1, issue, ["bug", "enhancement"], None)
     assert plan == [("propose_add_labels", {"labels": ["enhancement"]})]
+
+
+def test_plan_matches_repo_labels_case_insensitively_and_uses_the_repo_spelling():
+    plan = triage._plan_from_classification(_classification(labels_to_add=["BUG", "bug", "Enhancement"]), "o/r", 1, _issue(1), ["bug", "enhancement"], None)
+    assert plan == [("propose_add_labels", {"labels": ["bug", "enhancement"]})]
+
+
+def test_plan_tolerates_null_labels_and_assignees_on_the_issue():
+    issue = _issue(1)
+    issue["labels"] = None
+    issue["assignees"] = None
+    plan = triage._plan_from_classification(_classification(labels_to_add=["bug"], assign_to="octocat"), "o/r", 1, issue, ["bug"], ["octocat"])
+    assert [name for name, _ in plan] == ["propose_add_labels", "propose_assign"]
 
 
 def test_plan_drops_labels_that_do_not_exist_on_the_repo():
@@ -216,11 +246,155 @@ def test_sanitize_drops_an_unhashable_close_reason_instead_of_raising():
     assert "close_reason" in result["rationale"]
 
 
+def _bad_request(message):
+    request = httpx.Request("POST", "https://api.groq.com/x")
+    return triage.BadRequestError(message, response=httpx.Response(400, request=request), body=None)
+
+
 def test_complete_once_falls_back_when_json_mode_is_rejected():
     client = MagicMock()
-    rejected = triage.BadRequestError.__new__(triage.BadRequestError)
-    client.chat.completions.create.side_effect = [rejected, "ok"]
+    client.chat.completions.create.side_effect = [_bad_request("response_format json_object is not supported"), "ok"]
 
     assert triage._complete_once(client, "m", []) == "ok"
     assert client.chat.completions.create.call_count == 2
     assert "response_format" not in client.chat.completions.create.call_args_list[1].kwargs
+
+
+def test_complete_once_does_not_retry_a_bad_request_unrelated_to_json_mode():
+    client = MagicMock()
+    client.chat.completions.create.side_effect = [_bad_request("Please reduce the length of the messages")]
+
+    with pytest.raises(triage.BadRequestError):
+        triage._complete_once(client, "m", [])
+
+    assert client.chat.completions.create.call_count == 1
+
+
+def test_rate_limit_sleep_is_capped(monkeypatch):
+    request = httpx.Request("POST", "https://api.groq.com/x")
+    response = httpx.Response(429, request=request, headers={"retry-after": "7200"})
+    error = triage.RateLimitError("slow down", response=response, body=None)
+    slept = []
+    monkeypatch.setattr(triage.time, "sleep", lambda seconds: slept.append(seconds))
+    client = MagicMock()
+    client.chat.completions.create.side_effect = error
+
+    with pytest.raises(triage.RateLimitError):
+        triage._create_completion([client], "m", [])
+
+    assert slept == [triage.MAX_RETRY_AFTER_SECONDS]
+
+
+def _run_one(monkeypatch, classification, issue_numbers=(1,), propose_side_effect=None):
+    _listing(monkeypatch, [{"number": n, "title": "t", "body": "b"} for n in issue_numbers])
+    monkeypatch.setattr(triage.tools, "get_issue", MagicMock(side_effect=lambda *a, **k: _issue(a[3])))
+    monkeypatch.setattr(triage, "classify_issue", MagicMock(return_value=classification))
+    if propose_side_effect is not None:
+        monkeypatch.setitem(triage.PROPOSE_DISPATCH, "propose_add_labels", MagicMock(side_effect=propose_side_effect))
+
+
+def test_an_issue_with_no_action_is_recorded_so_it_is_not_reclassified_forever(monkeypatch, patched):
+    _run_one(monkeypatch, _classification())
+
+    results = triage.run_triage("owner/repo", "test")
+
+    assert results[0]["outcome"] == "no_action"
+    digest = triage.tools.content_hash("t", "b")
+    patched.assert_called_once_with("dsn", "owner/repo", 1, digest, "no_action", None)
+
+
+def test_an_issue_with_a_queued_proposal_is_recorded_as_proposed(monkeypatch, patched):
+    _run_one(monkeypatch, _classification(labels_to_add=["bug"]), propose_side_effect=lambda *a, **k: {"id": "p1"})
+
+    triage.run_triage("owner/repo", "test")
+
+    assert patched.call_args.args[4] == "proposed"
+
+
+def test_an_issue_that_raises_is_recorded_as_an_error_with_its_message(monkeypatch, patched):
+    _listing(monkeypatch, [{"number": 1, "title": "t", "body": "b"}])
+    monkeypatch.setattr(triage.tools, "get_issue", MagicMock(side_effect=RuntimeError("boom")))
+
+    results = triage.run_triage("owner/repo", "test")
+
+    assert results[0]["outcome"] == "error"
+    assert patched.call_args.args[4] == "error"
+    assert "RuntimeError: boom" in patched.call_args.args[5]
+
+
+def test_queued_proposals_are_kept_in_the_result_when_a_later_step_raises(monkeypatch, patched):
+    _run_one(monkeypatch, _classification(labels_to_add=["bug"], comment="hi"))
+    monkeypatch.setitem(triage.PROPOSE_DISPATCH, "propose_add_labels", MagicMock(return_value={"id": "p1"}))
+    monkeypatch.setitem(triage.PROPOSE_DISPATCH, "propose_add_comment", MagicMock(side_effect=RuntimeError("db down")))
+
+    results = triage.run_triage("owner/repo", "test")
+
+    assert results[0]["outcome"] == "error"
+    assert results[0]["proposals"][0]["result"]["id"] == "p1"
+
+
+def test_a_full_initiator_queue_stops_the_run_and_records_nothing_for_that_issue(monkeypatch, patched, capsys):
+    full = triage.tools.QueueFullError("queue full", "initiator")
+    _run_one(monkeypatch, _classification(labels_to_add=["bug"]), issue_numbers=(1, 2, 3), propose_side_effect=full)
+    classify = triage.classify_issue
+
+    results = triage.run_triage("owner/repo", "test")
+
+    assert [r["issue_number"] for r in results] == [1]
+    assert classify.call_count == 1
+    patched.assert_not_called()
+    assert "queue" in capsys.readouterr().err
+
+
+def test_a_full_per_issue_queue_skips_only_that_issue_and_does_not_record_it(monkeypatch, patched):
+    full = triage.tools.QueueFullError("issue full", "issue")
+    calls = []
+
+    def propose(dsn, rc, repo, num, args, initiator, flagged, issue, **kwargs):
+        calls.append(num)
+        if num == 1:
+            raise full
+        return {"id": f"p{num}"}
+
+    _run_one(monkeypatch, _classification(labels_to_add=["bug"]), issue_numbers=(1, 2), propose_side_effect=propose)
+
+    results = triage.run_triage("owner/repo", "test")
+
+    assert calls == [1, 2]
+    assert [r["issue_number"] for r in results] == [1, 2]
+    assert [c.args[2] for c in patched.call_args_list] == [2]
+
+
+def test_a_failure_to_record_an_attempt_does_not_abort_the_run(monkeypatch, patched, capsys):
+    patched.side_effect = RuntimeError("db down")
+    _run_one(monkeypatch, _classification(), issue_numbers=(1, 2))
+
+    results = triage.run_triage("owner/repo", "test")
+
+    assert len(results) == 2
+    assert "could not record the triage attempt" in capsys.readouterr().err
+
+
+def test_the_known_unchanged_issues_are_passed_to_the_listing(monkeypatch, patched):
+    monkeypatch.setattr(triage.tools, "list_triage_skips", MagicMock(return_value={4: "abc"}))
+    listing = _listing(monkeypatch, [])
+
+    triage.run_triage("owner/repo", "test")
+
+    assert listing.call_args.kwargs["unchanged"] == {4: "abc"}
+
+
+def test_the_configured_comment_limit_reaches_the_comment_proposal(monkeypatch, patched):
+    _run_one(monkeypatch, _classification(comment="hello"))
+    seen = {}
+
+    def fake_comment(dsn, rc, repo, num, body, initiator, **kwargs):
+        seen.update(kwargs)
+        return {"id": "c1"}
+
+    monkeypatch.setattr(triage.tools, "propose_add_comment", fake_comment)
+
+    triage.run_triage("owner/repo", "test")
+
+    assert seen["max_body_chars"] == 65536
+    assert seen["rationale"] == "r"

@@ -64,7 +64,7 @@ Each process is started separately and loads only the credentials it needs.
 | Read | `get_issue` | One issue with its comments |
 | Read | `list_pull_requests` | List pull requests |
 | Read | `search_issues` | Search within one repo. `repo:`, `org:`, `user:`, `owner:` qualifiers are rejected and results from other repos are dropped |
-| Read | `get_repo_activity_summary` | Issues opened, issues closed, distinct issues with comments, and opened issues by label, over 1 to 365 days |
+| Read | `get_repo_activity_summary` | Issues opened, issues closed, distinct issues with comments, and opened issues by label, over 1 to 365 days. On very busy repos the counts are returned as lower bounds with `truncated: true` instead of failing |
 | Propose | `propose_add_comment` | Queue a comment |
 | Propose | `propose_add_labels` | Queue label additions, checked against the repo's labels |
 | Propose | `propose_remove_labels` | Queue label removals |
@@ -76,8 +76,13 @@ Each process is started separately and loads only the credentials it needs.
 - **Model:** `openai/gpt-oss-20b` on Groq by default (`--model` to change). One call per issue, JSON mode requested with one fallback call if the model rejects it, and a second key (`GROQ_API_KEY_FALLBACK`) tried on rate limits.
 - **Trusted context:** the classifier is told the issue's state, current labels and assignees, the labels that exist on the repo, and who can be assigned. Untrusted issue text is passed separately, inside delimiters.
 - **Plan filtering:** proposals for labels already on the issue, labels not on the repo, assignees who are already assigned or not assignable, and closes on issues that are not open are dropped before anything is queued.
-- **Memory:** issues that already have an agent proposal in status `pending`, `approving`, `rejected`, or `executed` are skipped on later runs. `expired`, `failed`, and `stale` proposals do not count, so those issues are re-evaluated.
+- **Memory:** issues that already have an agent proposal in status `pending`, `approving`, `rejected`, or `executed` are skipped on later runs. `expired`, `failed`, and `stale` proposals do not count, so those issues are re-evaluated. Every issue the agent looks at is also recorded in `triage_attempts`. An issue where the model proposed nothing is skipped until its title or body changes, and an issue that keeps raising errors is retried up to 3 times. Without this, issues that need no action would fill the `--max-issues` slots on every run and later issues would never be reached.
+- **Full queue:** if a proposal is refused because the initiator's queue is full, the run stops instead of spending model calls on issues it cannot queue, and those issues are not recorded so they are retried next time.
+- **Rationale:** the model's rationale is stored with each proposal and shown to the approver.
 - **Flags:** `--state`, `--max-issues`, `--since`, `--max-pages`, `--model`.
+- **Listing:** issues are read page by page and listing stops as soon as `--max-issues` candidates are found. If `--max-pages` is reached first, the run continues with the candidates it has and prints a warning to stderr instead of aborting.
+- **Prompt size:** the classifier sees at most 300 characters of title, 8000 of body, and the 10 most recent comments (1500 characters each, 6000 in total), with truncation noted inline, so a huge issue cannot exceed the model's request limits.
+- **Names:** repo names are lower-cased everywhere. Label and assignee names are matched case-insensitively and stored with the spelling GitHub uses.
 
 ## Guardrails
 
@@ -85,16 +90,22 @@ Each process is started separately and loads only the credentials it needs.
 - **Repo allowlist:** every read and propose call checks `repo_allowlist.active` first. Deactivating a repo keeps its history intact.
 - **Lease-based claiming:** approval flips a row from `pending` to `approving` in a short transaction and returns a lease token. Every later write is conditioned on that lease, so two approvers cannot both execute the same action. No database lock is held across a GitHub call.
 - **Scoped stale check:** an approval is refused if the title or body changed, if a close targets an issue that is no longer open, if a label to remove is already gone, or if an identical comment already exists. Unrelated changes do not block sibling proposals.
+- **Proposal-time checks:** the propose tools reject actions that can only go stale, such as closing an issue that is not open, removing a label the issue does not have, adding labels it already has, or assigning someone already assigned.
+- **Transient failures:** if GitHub cannot be read while approving, nothing has been sent, so the claim is released and the row returns to `pending` for a retry. Only a missing issue (404 or 410) fails the action permanently. After a successful GitHub write, recording the result is retried on a fresh connection, and a persistent database failure is reported as `recording_failed` instead of an exception.
 - **Outcome checks:** after an assign, the response is checked and the action fails if GitHub did not apply it. A network failure during a write is reported as `outcome_unknown` so the approver checks GitHub before retrying.
-- **Queue limits:** at most `MAX_PENDING_PER_ISSUE` (10) and `MAX_PENDING_PER_INITIATOR` (500) open proposals, enforced before any GitHub call. This bounds what a prompt-injected client can queue.
-- **Timeouts:** every GitHub request has a 15 second timeout. Pagination raises `PaginationLimitExceededError` instead of silently truncating.
-- **Crash recovery:** rows stuck in `approving` longer than `STUCK_APPROVING_RECOVERY_MINUTES` return to `pending`, with an audit entry.
-- **Proposal expiry:** unapproved proposals expire after `PENDING_ACTION_TTL_HOURS` (48).
-- **Dashboard access:** an optional `DASHBOARD_ACCESS_TOKEN` gates the app, with failed attempts throttled to 5 per minute.
+- **Queue limits:** at most `MAX_PENDING_PER_ISSUE` (10) and `MAX_PENDING_PER_INITIATOR` (500) open proposals. The counts are checked inside the insert transaction while holding two advisory locks, one per initiator and one per issue, always taken in that order, so concurrent proposals cannot exceed either limit and cannot deadlock. This bounds what a prompt-injected client can queue. A first check before the issue is fetched makes a full queue fail fast. For label and assignee proposals that first check runs after the label or assignee lookup.
+- **Timeouts:** every GitHub request has a 15 second timeout. Pagination raises `PaginationLimitExceededError` instead of silently truncating. Callers that can work with partial data (the triage agent, the activity summary, comment reads) catch it and flag the result as truncated.
+- **Atomic bookkeeping:** every status change is written in the same transaction as its audit row: claim, executed, failed, stale, released, expired, recovered, and rejected. The claim also records who started the approval (`claimed_by`), so a crash mid-approval still shows who did it. If the connection drops after a write, the retry recognizes an already committed result by its lease and does not report a false lost lease.
+- **Label recreation guard:** GitHub creates a label that does not exist when it is added to an issue. Approving an add-labels proposal re-reads the repo's labels and marks the action stale if any of them has been deleted since.
+- **Crash recovery:** rows stuck in `approving` longer than `STUCK_APPROVING_RECOVERY_MINUTES` return to `pending`, with an audit entry naming the approver who had started it.
+- **Proposal expiry:** unapproved proposals expire after `PENDING_ACTION_TTL_HOURS` (48), with an audit entry per expired row.
+- **Dashboard access:** the dashboard refuses to start unless `DASHBOARD_ACCESS_TOKEN` is set. Running without one needs an explicit `DASHBOARD_ALLOW_INSECURE=true`, meant for a machine only you can reach. Failed attempts are throttled per session (5 per minute), so another visitor cannot lock you out. Failures across all sessions only add a delay to further failed attempts and never block a correct token.
+- **Review panel:** each pending action shows the model's rationale and the issue text it was based on (title, body, and the last 10 comments, bounded), stored at proposal time so the approver reads what the proposer saw. Matched injection phrases are listed, and a flagged proposal cannot be approved until the approver ticks an acknowledgement. The optional live view loads the current issue with comments.
+- **Repo names:** the allowlist stores lower-case `owner/name` values and the database rejects `.` and `..` segments.
 
 ## Safety
 
-Issue titles, bodies, and comments come from the open internet and are treated as untrusted. The classifier prompt wraps them in `<untrusted_issue_content>` markers, strips any copy of those markers out of the text first so an issue cannot fake a closing tag, and instructs the model to treat the content as data only. Tool descriptions carry the same warning for MCP clients. A coarse phrase check (`is_heuristically_flagged`) marks suspicious proposals in the dashboard. It is a visible hint for the approver, not a security boundary.
+Issue titles, bodies, and comments come from the open internet and are treated as untrusted. The classifier prompt wraps them in `<untrusted_issue_content>` markers, strips any copy of those markers out of the text first so an issue cannot fake a closing tag, and instructs the model to treat the content as data only. Tool descriptions carry the same warning for MCP clients. A coarse phrase check (`is_heuristically_flagged`) marks suspicious proposals in the dashboard, after Unicode normalization and removal of zero-width characters. It is a visible hint for the approver, not a security boundary.
 
 ## Project Structure
 ```
@@ -114,11 +125,12 @@ issueops-mcp/
 │   └── heuristics.py
 │
 ├── mcp_server/server.py       # MCP server exposing the 10 tools
-├── dashboard/app.py           # Streamlit approval UI and audit log view
+├── dashboard/
+│   ├── app.py                 # Streamlit approval UI and audit log view
+│   └── auth.py                # access token check and per-session throttle
 │
 ├── db/
-│   ├── schema.sql             # tables and indexes
-│   └── migrations/            # upgrade scripts for existing databases
+│   └── schema.sql             # idempotent: creates a fresh database or upgrades an existing one
 │
 ├── eval/
 │   ├── eval.py                # classification, adversarial, and audit-consistency checks
@@ -152,7 +164,7 @@ issueops-mcp/
    pip install -r requirements.txt
    ```
 
-3. **Database**, no local `psql` needed. Open your Neon project's **SQL Editor**, paste in [`db/schema.sql`](db/schema.sql), and run it. If you are upgrading an existing database, run [`db/migrations/001_hardening.sql`](db/migrations/001_hardening.sql) instead.
+3. **Database**, no local `psql` needed. Open your Neon project's **SQL Editor**, paste in [`db/schema.sql`](db/schema.sql), and run it. The script is idempotent, so the same file creates a fresh database and upgrades an existing one (it adds missing columns and statuses, lower-cases stored repo names, and re-creates the constraints). It is safe to run again after pulling new versions.
 
 4. **Env files.** Keep the write token out of the read-only processes' file.
 
@@ -201,7 +213,7 @@ To use the MCP server from Claude Desktop, add this to `claude_desktop_config.js
 }
 ```
 
-In the dashboard, enter the access token and your name in the sidebar, expand a pending action, click **Load source issue**, then **Approve** or **Reject**. Check the audit log at the bottom of the page and the issue on GitHub.
+In the dashboard, enter the access token and your name in the sidebar, expand a pending action, read the rationale and the issue text it was based on (tick the acknowledgement if it is flagged), optionally click **Load current issue from GitHub**, then **Approve** or **Reject**. Check the audit log at the bottom of the page and the issue on GitHub.
 
 ## Configuration
 
@@ -219,14 +231,15 @@ In the dashboard, enter the access token and your name in the sidebar, expand a 
 | `MAX_PENDING_PER_ISSUE` | 10 | Open proposals per issue |
 | `MAX_PENDING_PER_INITIATOR` | 500 | Open proposals per initiator |
 | `MCP_CLIENT_LABEL` | none | Label recorded as the MCP initiator |
-| `DASHBOARD_ACCESS_TOKEN` | none | Gates the dashboard |
+| `DASHBOARD_ACCESS_TOKEN` | none | Gates the dashboard. Required unless `DASHBOARD_ALLOW_INSECURE` is set |
+| `DASHBOARD_ALLOW_INSECURE` | false | Lets the dashboard run without a token |
 | `ISSUEOPS_ENV_FILE` | auto-discovered `.env` | Env file for this process |
 
 ## Testing
 
 Run `pytest` from the repo root.
 
-Most tests use the fake database in `conftest.py` to check SQL call sequences, and mocks for the GitHub clients. Those cannot verify locking. `tests/test_integration_postgres.py` runs against a real Postgres and covers concurrent approvals, lease reclamation, concurrent dedup, queue caps, and the status constraint. It is skipped unless `TEST_DATABASE_URL` points at a scratch database. Each test creates and drops its own schema, and CI runs them against a Postgres service container.
+Most tests use the fake database in `conftest.py` to check SQL call sequences, and mocks for the GitHub clients. Those cannot verify locking. `tests/test_integration_postgres.py` runs against a real Postgres and covers concurrent approvals, lease reclamation, concurrent dedup, queue caps under concurrent proposals, deadlock freedom, atomic audit writes, retry after a dropped connection, triage memory, the schema upgrade from a legacy database, and audit pruning. `tests/test_dashboard.py` drives the dashboard headlessly, and its database-backed cases use the same variable. It is skipped unless `TEST_DATABASE_URL` points at a scratch database. Each test creates and drops its own schema, and CI runs them against a Postgres service container.
 
 ## Evaluation
 
@@ -238,7 +251,7 @@ Copy [`eval/labels_template.json`](eval/labels_template.json) as a starting poin
 
 - **Classification accuracy** on non-adversarial issues, compared with `expected_labels`.
 - **Adversarial behavior** on issues containing injected instructions, where the correct outcome is no action. `adversarial_any_action_rate` counts any proposal the plan would queue, and `proposal_level_susceptibility` also counts injection markers appearing in the model output.
-- **Audit consistency**, checked in both directions between `audit_log` and `pending_actions`. Both tables are written by this code, so this catches bookkeeping bugs, not a write made outside the dashboard with the write token. To catch that, review the write token's activity in GitHub's audit log.
+- **Audit consistency**, checked in both directions between `audit_log` and `pending_actions`. Both tables are written by this code, so this catches bookkeeping bugs, not a write made outside the dashboard with the write token. Executed actions older than the most recent audit prune are not counted, because their audit rows were deleted on purpose. To catch a write made outside the dashboard, review the write token's activity in GitHub's audit log.
 
 No labeled dataset is shipped, only the template.
 
@@ -247,9 +260,11 @@ No labeled dataset is shipped, only the template.
 - The injection heuristic is advisory. An attacker only has to avoid the listed phrases.
 - Approver identity in the dashboard is a typed name, not authentication. The access token gates the app but does not tell approvers apart, and its throttle is a speed bump, not a defense.
 - Recovery of a row stuck in `approving` runs on dashboard page loads, not in a background worker, and it is time-based rather than a liveness check. In the rare case where the original call was only slow, the result is reported as `lost_lease_after_execution` and a person must check GitHub for a duplicate.
-- The stale check does not cover new comments or edits to existing comments. A stale or failed action is terminal, so the agent can re-propose it on a later run but a person cannot retry it.
+- The stale check does not cover new comments or edits to existing comments. The approver sees the comments as they were at proposal time and can load the current ones. A `stale` or `failed` action is terminal, so the agent can re-propose it on a later run but a person cannot retry it. A GitHub read failure during approval is not terminal: the row is released back to `pending`.
 - `propose_remove_labels` calls GitHub once per label and can partially succeed. The failure message lists what was removed and what was not.
 - The label and assignee caches are process-local with a 5 minute TTL and are not shared across workers.
-- Very large repos can hit the pagination limit (20 pages, 2000 items by default). The call fails loudly instead of under-reporting. Narrow the query or raise `--max-pages`.
+- Very large repos can hit the pagination limit (20 pages, 2000 items by default). Plain listing calls (`list_issues` over MCP) fail loudly instead of under-reporting; narrow the query or raise `--max-pages`. Triage, the activity summary, and comment reads return partial results flagged as truncated. When an issue has more than 2000 comments, only the first 2000 are read, so the duplicate-comment check on approval covers only those.
 - The MCP initiator string includes the process id, so the per-initiator queue cap is per process, not per person.
+- All processes share one database role. The audit log is append-only by convention, and the prune script records what it removed as a `prune_audit_log` entry. Separate roles with insert-only access for the MCP server and the agent would enforce it.
+- Both `list_issues` and `get_issue` over MCP return raw GitHub JSON without field trimming.
 - No dependency lockfile or license file is included. Choosing a license is up to the repository owner.

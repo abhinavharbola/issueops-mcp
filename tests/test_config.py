@@ -16,6 +16,7 @@ REQUIRED_VARS = [
     "COMMENT_BODY_MAX_CHARS",
     "MCP_CLIENT_LABEL",
     "DASHBOARD_ACCESS_TOKEN",
+    "DASHBOARD_ALLOW_INSECURE",
     "ISSUEOPS_ENV_FILE",
 ]
 
@@ -233,3 +234,21 @@ def test_real_environment_variables_win_over_the_env_file(tmp_path, monkeypatch)
     monkeypatch.setenv("NEON_DSN", "postgresql://from-real-env")
 
     assert config.load_config().neon_dsn == "postgresql://from-real-env"
+
+
+@pytest.mark.parametrize("raw, expected", [("true", True), ("1", True), ("YES", True), ("false", False), ("", False), ("nope", False)])
+def test_dashboard_allow_insecure_is_parsed_from_the_environment(monkeypatch, raw, expected):
+    _clear_env(monkeypatch)
+    _set_minimum_required_env(monkeypatch)
+    monkeypatch.setenv("DASHBOARD_ALLOW_INSECURE", raw)
+
+    result = config.load_config(require_write_pat=False)
+
+    assert result.dashboard_allow_insecure is expected
+
+
+def test_dashboard_allow_insecure_defaults_to_false(monkeypatch):
+    _clear_env(monkeypatch)
+    _set_minimum_required_env(monkeypatch)
+
+    assert config.load_config(require_write_pat=False).dashboard_allow_insecure is False

@@ -19,6 +19,7 @@ class Config:
     comment_body_max_chars: int = 65536
     mcp_client_label: str | None = None
     dashboard_access_token: str | None = None
+    dashboard_allow_insecure: bool = False
 
 
 _write_pat_dropped_in_process = False
@@ -90,4 +91,5 @@ def load_config(require_write_pat: bool = False, require_groq: bool = False) -> 
         comment_body_max_chars=optional_int("COMMENT_BODY_MAX_CHARS", 65536),
         mcp_client_label=os.environ.get("MCP_CLIENT_LABEL") or None,
         dashboard_access_token=os.environ.get("DASHBOARD_ACCESS_TOKEN") or None,
+        dashboard_allow_insecure=os.environ.get("DASHBOARD_ALLOW_INSECURE", "").strip().lower() in ("1", "true", "yes"),
     )

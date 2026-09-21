@@ -1,12 +1,14 @@
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
+import psycopg
 import pytest
 import requests
 
 import issueops.actions as actions
 import issueops.tools as tools
 from conftest import FakeConn
+from issueops.github_client import GitHubAPIError
 
 
 def _pending_row(**overrides):
@@ -321,7 +323,7 @@ def test_approve_action_flags_a_lost_lease_when_github_call_raises_after_lease_l
     assert "GitHub 500" in result["error"]
 
 
-def test_approve_action_marks_failed_when_the_stale_check_fetch_raises():
+def test_a_transient_read_failure_releases_the_claim_instead_of_failing_the_action():
     row = _pending_row()
     conn = FakeConn(pending_action_row=row)
     read_client = MagicMock()
@@ -330,10 +332,102 @@ def test_approve_action_marks_failed_when_the_stale_check_fetch_raises():
 
     result = actions.approve_action(conn, read_client, write_client, "action-1", "alice")
 
-    assert result["status"] == "failed"
+    assert result["status"] == "released"
     assert "GitHub unreachable" in result["error"]
     write_client.add_comment.assert_not_called()
+    assert any("status = 'pending', claimed_at = NULL" in sql for sql, _ in conn.queries)
+    assert not any("status = 'failed'" in sql for sql, _ in conn.queries)
+    audit_inserts = [params for sql, params in conn.queries if "INSERT INTO audit_log" in sql]
+    assert any(params[6] == "released" for params in audit_inserts)
+
+
+def test_a_github_auth_failure_on_the_read_releases_the_claim():
+    row = _pending_row()
+    conn = FakeConn(pending_action_row=row)
+    read_client = MagicMock()
+    read_client.get_issue.side_effect = GitHubAPIError(401, "Bad credentials")
+
+    result = actions.approve_action(conn, read_client, MagicMock(), "action-1", "alice")
+
+    assert result["status"] == "released"
+
+
+def test_a_missing_issue_on_the_read_fails_the_action_permanently():
+    row = _pending_row()
+    conn = FakeConn(pending_action_row=row)
+    read_client = MagicMock()
+    read_client.get_issue.side_effect = GitHubAPIError(404, "Not Found")
+    write_client = MagicMock()
+
+    result = actions.approve_action(conn, read_client, write_client, "action-1", "alice")
+
+    assert result["status"] == "failed"
+    write_client.add_comment.assert_not_called()
     assert any("status = 'failed'" in sql for sql, _ in conn.queries)
+
+
+def test_the_duplicate_comment_check_reads_comments_with_partial_results_allowed():
+    row = _pending_row()
+    conn = FakeConn(pending_action_row=row)
+    read_client = _read_client()
+
+    actions.approve_action(conn, read_client, MagicMock(), "action-1", "alice")
+
+    read_client.get_issue_comments.assert_called_once_with("owner/repo", 5, allow_partial=True)
+
+
+def test_remove_labels_stale_check_ignores_label_case():
+    row = _pending_row(tool_name="propose_remove_labels", arguments={"labels": ["bug"]})
+    conn = FakeConn(pending_action_row=row)
+    read_client = _read_client(snapshot={"state": "open", "labels": ["Bug"], "assignees": []})
+    write_client = MagicMock()
+
+    result = actions.approve_action(conn, read_client, write_client, "action-1", "alice")
+
+    assert result["status"] == "executed"
+    write_client.remove_label.assert_called_once_with("owner/repo", 5, "bug")
+
+
+class _BrokenThenHealthyConn:
+    def __init__(self, inner, failures):
+        self.inner = inner
+        self.failures = failures
+
+    def execute(self, sql, params=None):
+        if "SET status = 'executed'" in " ".join(sql.split()) and self.failures > 0:
+            self.failures -= 1
+            raise psycopg.OperationalError("connection dropped")
+        return self.inner.execute(sql, params)
+
+    def transaction(self):
+        return self.inner.transaction()
+
+
+def test_recording_is_retried_after_the_github_call_when_the_database_blips(monkeypatch):
+    monkeypatch.setattr(actions.time, "sleep", lambda seconds: None)
+    row = _pending_row()
+    inner = FakeConn(pending_action_row=row)
+    conn = _BrokenThenHealthyConn(inner, failures=1)
+    write_client = MagicMock()
+
+    result = actions.approve_action(conn, _read_client(), write_client, "action-1", "alice")
+
+    assert result["status"] == "executed"
+    write_client.add_comment.assert_called_once()
+
+
+def test_recording_failure_after_a_successful_github_call_is_reported_without_raising(monkeypatch):
+    monkeypatch.setattr(actions.time, "sleep", lambda seconds: None)
+    row = _pending_row()
+    inner = FakeConn(pending_action_row=row)
+    conn = _BrokenThenHealthyConn(inner, failures=99)
+    write_client = MagicMock()
+
+    result = actions.approve_action(conn, _read_client(), write_client, "action-1", "alice")
+
+    assert result["status"] == "recording_failed"
+    assert result["github_call_succeeded"] is True
+    write_client.add_comment.assert_called_once()
 
 
 def test_approve_action_marks_failed_when_github_call_raises():
@@ -472,3 +566,122 @@ def test_claim_compares_the_row_age_against_the_database_clock():
     result = actions.approve_action(conn, _read_client(), write_client, "action-1", "alice")
 
     assert result["status"] == "executed"
+
+
+def _audit_statuses(conn):
+    return [params[6] for sql, params in conn.queries if "INSERT INTO audit_log" in sql]
+
+
+def test_the_claim_writes_its_own_audit_row_and_records_the_approver():
+    conn = FakeConn(pending_action_row=_pending_row())
+
+    actions.approve_action(conn, _read_client(), MagicMock(), "action-1", "alice")
+
+    claim_updates = [(sql, params) for sql, params in conn.queries if "SET status = 'approving'" in sql]
+    assert claim_updates and claim_updates[0][1] == ("alice", "action-1")
+    assert _audit_statuses(conn)[0] == "claimed"
+
+
+def test_the_executed_status_and_its_audit_row_are_written_in_the_same_transaction():
+    conn = FakeConn(pending_action_row=_pending_row())
+    in_transaction_at_audit = {}
+    original_execute = conn.execute
+
+    def tracking_execute(sql, params=None):
+        if "INSERT INTO audit_log" in sql:
+            in_transaction_at_audit[params[6]] = conn.in_transaction
+        return original_execute(sql, params)
+
+    conn.execute = tracking_execute
+
+    actions.approve_action(conn, _read_client(), MagicMock(), "action-1", "alice")
+
+    assert in_transaction_at_audit["executed"] is True
+    assert in_transaction_at_audit["claimed"] is True
+
+
+def test_a_failed_github_call_writes_its_audit_row_in_the_same_transaction_as_the_failed_status():
+    conn = FakeConn(pending_action_row=_pending_row())
+    write_client = MagicMock()
+    write_client.add_comment.side_effect = RuntimeError("GitHub 500")
+    in_transaction_at_audit = {}
+    original_execute = conn.execute
+
+    def tracking_execute(sql, params=None):
+        if "INSERT INTO audit_log" in sql:
+            in_transaction_at_audit[params[6]] = conn.in_transaction
+        return original_execute(sql, params)
+
+    conn.execute = tracking_execute
+
+    actions.approve_action(conn, _read_client(), write_client, "action-1", "alice")
+
+    assert in_transaction_at_audit["failed"] is True
+
+
+def test_no_executed_audit_row_is_written_when_the_lease_was_lost_during_the_github_call():
+    conn = FakeConn(pending_action_row=_pending_row())
+    write_client = MagicMock()
+    write_client.add_comment.side_effect = lambda *a, **k: setattr(conn, "lease_held", False)
+
+    result = actions.approve_action(conn, _read_client(), write_client, "action-1", "alice")
+
+    assert result["status"] == "lost_lease_after_execution"
+    assert "executed" not in _audit_statuses(conn)
+    assert "lost_lease_after_execution" in _audit_statuses(conn)
+
+
+def test_expiring_pending_actions_audits_each_expired_row():
+    expired = [{"id": "e-1", "tool_name": "propose_close", "repo": "owner/repo", "issue_number": 3, "arguments": {}}]
+    conn = FakeConn(stuck_approving_rows=expired)
+
+    rows = actions.expire_stale_pending(conn, ttl_hours=24)
+
+    assert rows == expired
+    audit_params = next(params for sql, params in conn.queries if "INSERT INTO audit_log" in sql)
+    assert audit_params[5] == "system:expiry" and audit_params[6] == "expired"
+
+
+def test_the_add_labels_approval_goes_stale_when_a_label_no_longer_exists_on_the_repo():
+    row = _pending_row(tool_name="propose_add_labels", arguments={"labels": ["Bug"]})
+    conn = FakeConn(pending_action_row=row)
+    read_client = _read_client()
+    read_client.get_repo_labels.return_value = [{"name": "enhancement"}]
+    write_client = MagicMock()
+
+    result = actions.approve_action(conn, read_client, write_client, "action-1", "alice")
+
+    assert result["status"] == "stale"
+    write_client.add_labels.assert_not_called()
+
+
+def test_the_add_labels_approval_executes_when_the_label_exists_in_any_case():
+    row = _pending_row(tool_name="propose_add_labels", arguments={"labels": ["Bug"]})
+    conn = FakeConn(pending_action_row=row)
+    read_client = _read_client()
+    read_client.get_repo_labels.return_value = [{"name": "bug"}]
+    write_client = MagicMock()
+
+    result = actions.approve_action(conn, read_client, write_client, "action-1", "alice")
+
+    assert result["status"] == "executed"
+
+
+def test_a_failure_to_read_the_repo_labels_releases_the_claim():
+    row = _pending_row(tool_name="propose_add_labels", arguments={"labels": ["bug"]})
+    conn = FakeConn(pending_action_row=row)
+    read_client = _read_client()
+    read_client.get_repo_labels.side_effect = GitHubAPIError(502, "bad gateway")
+
+    result = actions.approve_action(conn, read_client, MagicMock(), "action-1", "alice")
+
+    assert result["status"] == "released"
+
+
+def test_rejecting_records_the_rejector_in_the_rejected_columns():
+    conn = FakeConn(pending_action_row=_pending_row())
+
+    actions.reject_action(conn, "action-1", "alice")
+
+    update = next(sql for sql, _ in conn.queries if "status = 'rejected'" in sql)
+    assert "rejected_by" in update and "approved_by" not in update

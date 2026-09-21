@@ -191,7 +191,7 @@ def test_propose_assign_with_a_prefetched_issue_uses_it_for_the_snapshot(monkeyp
     _patch_sync_connection(monkeypatch, fake_conn)
     read_client = _read_client()
     prefetched = {
-        "state": "closed", "labels": [{"name": "bug"}], "assignees": [{"login": "octocat"}],
+        "state": "open", "labels": [{"name": "bug"}], "assignees": [{"login": "someone-else"}],
         "title": "t", "body": "b", "comments_detail": [],
     }
 
@@ -199,7 +199,7 @@ def test_propose_assign_with_a_prefetched_issue_uses_it_for_the_snapshot(monkeyp
 
     snapshot = _insert_params(fake_conn)[4]
     assert snapshot.obj == {
-        "state": "closed", "labels": ["bug"], "assignees": ["octocat"],
+        "state": "open", "labels": ["bug"], "assignees": ["someone-else"],
         "content_hash": tools.content_hash("t", "b"),
     }
     read_client.get_issue.assert_not_called()
@@ -300,3 +300,152 @@ def test_the_snapshot_records_a_content_hash_of_the_title_and_body(monkeypatch):
     tools.propose_close("dsn", read_client, "owner/repo", 1, "completed", "test")
 
     assert _insert_params(fake_conn)[4].obj["content_hash"] == tools.content_hash("t", "b")
+
+
+def test_propose_add_labels_resolves_case_and_stores_the_repo_spelling(monkeypatch):
+    fake_conn = FakeConn(new_id="c-1")
+    _patch_sync_connection(monkeypatch, fake_conn)
+    read_client = _read_client(labels=["bug", "Good First Issue"])
+
+    tools.propose_add_labels("dsn", read_client, "owner/repo", 1, ["BUG", "good first issue", "bug"], "test")
+
+    assert _insert_params(fake_conn)[3].obj == {"labels": ["Good First Issue", "bug"]}
+
+
+def test_propose_add_labels_rejects_when_every_label_is_already_on_the_issue(monkeypatch):
+    _patch_sync_connection(monkeypatch, FakeConn())
+    read_client = _read_client(
+        get_issue_return={"state": "open", "labels": [{"name": "Bug"}], "assignees": []}, labels=["bug"],
+    )
+
+    with pytest.raises(tools.ValidationError, match="already on the issue"):
+        tools.propose_add_labels("dsn", read_client, "owner/repo", 1, ["bug"], "test")
+
+
+def test_propose_remove_labels_rejects_a_label_that_is_not_on_the_issue(monkeypatch):
+    _patch_sync_connection(monkeypatch, FakeConn())
+    read_client = _read_client(labels=["bug", "wontfix"])
+
+    with pytest.raises(tools.ValidationError, match="not on the issue"):
+        tools.propose_remove_labels("dsn", read_client, "owner/repo", 1, ["wontfix"], "test")
+
+
+def test_propose_remove_labels_accepts_a_label_that_is_on_the_issue(monkeypatch):
+    fake_conn = FakeConn(new_id="r-1")
+    _patch_sync_connection(monkeypatch, fake_conn)
+    read_client = _read_client(
+        get_issue_return={"state": "open", "labels": [{"name": "wontfix"}], "assignees": []},
+        labels=["bug", "wontfix"],
+    )
+
+    result = tools.propose_remove_labels("dsn", read_client, "owner/repo", 1, ["WontFix"], "test")
+
+    assert result["id"] == "r-1"
+    assert _insert_params(fake_conn)[3].obj == {"labels": ["wontfix"]}
+
+
+def test_propose_close_rejects_an_issue_that_is_not_open(monkeypatch):
+    _patch_sync_connection(monkeypatch, FakeConn())
+    read_client = _read_client(get_issue_return={"state": "closed", "labels": [], "assignees": []})
+
+    with pytest.raises(tools.ValidationError, match="not open"):
+        tools.propose_close("dsn", read_client, "owner/repo", 1, "completed", "test")
+
+
+def test_propose_assign_rejects_a_user_who_is_already_assigned(monkeypatch):
+    _patch_sync_connection(monkeypatch, FakeConn())
+    read_client = _read_client(get_issue_return={"state": "open", "labels": [], "assignees": [{"login": "OctoCat"}]})
+
+    with pytest.raises(tools.ValidationError, match="already assigned"):
+        tools.propose_assign("dsn", read_client, "owner/repo", 1, "octocat", "test")
+
+
+def test_propose_assign_stores_the_login_spelling_from_the_repo(monkeypatch):
+    fake_conn = FakeConn(new_id="a-2")
+    _patch_sync_connection(monkeypatch, fake_conn)
+
+    tools.propose_assign("dsn", _read_client(assignees=("OctoCat",)), "owner/repo", 1, "octocat", "test")
+
+    assert _insert_params(fake_conn)[3].obj == {"assignee": "OctoCat"}
+
+
+def test_propose_tools_normalize_the_repo_name(monkeypatch):
+    fake_conn = FakeConn(new_id="n-1")
+    _patch_sync_connection(monkeypatch, fake_conn)
+
+    tools.propose_close("dsn", _read_client(), "Owner/Repo", 1, "completed", "test")
+
+    assert _insert_params(fake_conn)[1] == "owner/repo"
+
+
+def test_propose_tools_tolerate_null_labels_and_assignees_in_the_issue(monkeypatch):
+    fake_conn = FakeConn(new_id="n-2")
+    _patch_sync_connection(monkeypatch, fake_conn)
+    read_client = _read_client(get_issue_return={"state": "open", "labels": None, "assignees": None})
+
+    result = tools.propose_close("dsn", read_client, "owner/repo", 1, "completed", "test")
+
+    assert result["id"] == "n-2"
+
+
+def test_the_per_issue_cap_error_reports_its_scope(monkeypatch):
+    _patch_sync_connection(monkeypatch, FakeConn(pending_per_issue=tools.DEFAULT_MAX_PENDING_PER_ISSUE))
+
+    with pytest.raises(tools.QueueFullError) as exc_info:
+        tools.propose_close("dsn", _read_client(), "owner/repo", 1, "completed", "test")
+
+    assert exc_info.value.scope == "issue"
+
+
+def test_the_per_initiator_cap_error_reports_its_scope(monkeypatch):
+    _patch_sync_connection(monkeypatch, FakeConn(pending_per_initiator=tools.DEFAULT_MAX_PENDING_PER_INITIATOR))
+
+    with pytest.raises(tools.QueueFullError) as exc_info:
+        tools.propose_close("dsn", _read_client(), "owner/repo", 1, "completed", "test")
+
+    assert exc_info.value.scope == "initiator"
+
+
+def test_the_caps_are_checked_only_after_both_advisory_locks_are_held(monkeypatch):
+    fake_conn = FakeConn(new_id="l-1")
+    _patch_sync_connection(monkeypatch, fake_conn)
+
+    tools.propose_close("dsn", _read_client(), "owner/repo", 1, "completed", "agent:x")
+
+    statements = [sql for sql, _ in fake_conn.queries]
+    lock_positions = [i for i, sql in enumerate(statements) if "pg_advisory_xact_lock" in sql]
+    count_positions = [i for i, sql in enumerate(statements) if "SELECT count(*) AS n" in sql]
+    insert_position = next(i for i, sql in enumerate(statements) if "INSERT INTO pending_actions" in sql)
+    assert len(lock_positions) == 2
+    assert lock_positions[0] < lock_positions[1] < count_positions[-1] < insert_position
+    lock_params = [params for sql, params in fake_conn.queries if "pg_advisory_xact_lock" in sql]
+    assert lock_params[0] == (tools.LOCK_NAMESPACE_INITIATOR, "agent:x")
+    assert lock_params[1] == (tools.LOCK_NAMESPACE_ISSUE, "owner/repo:1")
+
+
+def test_build_source_excerpt_is_bounded_and_null_safe():
+    issue = {
+        "title": None, "body": "b" * 9000,
+        "comments_detail": [{"user": None, "body": None}] + [{"user": {"login": "u"}, "body": "c"}] * 12,
+    }
+
+    excerpt = tools.build_source_excerpt(issue)
+
+    assert excerpt["title"] == ""
+    assert excerpt["body"].endswith(f"[truncated {9000 - tools.EXCERPT_BODY_CHARS} chars]")
+    assert len(excerpt["comments"]) == tools.EXCERPT_MAX_COMMENTS
+    assert excerpt["comments_omitted"] == 3
+    assert excerpt["comments"][-1] == {"author": "u", "body": "c"}
+
+
+def test_the_rationale_is_stored_clipped(monkeypatch):
+    fake_conn = FakeConn(new_id="r-9")
+    _patch_sync_connection(monkeypatch, fake_conn)
+
+    tools.propose_close(
+        "dsn", _read_client(), "owner/repo", 1, "completed", "agent:x",
+        rationale="r" * (tools.RATIONALE_MAX_CHARS + 100),
+    )
+
+    params = _insert_params(fake_conn)
+    assert params[8].endswith("[truncated 100 chars]")

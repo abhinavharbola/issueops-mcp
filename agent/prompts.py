@@ -6,6 +6,12 @@ UNTRUSTED_END = "</untrusted_issue_content>"
 _MARKER_PATTERN = re.compile(r"<\s*/?\s*untrusted_issue_content\s*>", re.IGNORECASE)
 _MARKER_REPLACEMENT = "[untrusted-content-marker-stripped]"
 
+MAX_TITLE_CHARS = 300
+MAX_BODY_CHARS = 8000
+MAX_COMMENT_CHARS = 1500
+MAX_COMMENTS = 10
+MAX_COMMENTS_TOTAL_CHARS = 6000
+
 SYSTEM_PROMPT = """You are a triage classifier for GitHub issues. You read one issue and decide which \
 triage actions, if any, to propose. You never execute actions, you only classify.
 
@@ -33,14 +39,25 @@ def _sanitize_for_untrusted_block(text: str) -> str:
     return _MARKER_PATTERN.sub(_MARKER_REPLACEMENT, text or "")
 
 
+def _clip(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}[truncated {len(text) - limit} chars]"
+
+
 def build_untrusted_block(issue: dict) -> str:
-    title = _sanitize_for_untrusted_block(issue.get("title", ""))
-    body = _sanitize_for_untrusted_block(issue.get("body") or "")
-    comments_text = "\n".join(
-        f"comment by {c.get('user', {}).get('login', 'unknown')}: "
-        f"{_sanitize_for_untrusted_block(c.get('body', ''))}"
-        for c in issue.get("comments_detail", [])
-    )
+    title = _clip(_sanitize_for_untrusted_block(issue.get("title") or ""), MAX_TITLE_CHARS)
+    body = _clip(_sanitize_for_untrusted_block(issue.get("body") or ""), MAX_BODY_CHARS)
+    all_comments = issue.get("comments_detail") or []
+    recent_comments = all_comments[-MAX_COMMENTS:]
+    comment_lines = []
+    if len(all_comments) > len(recent_comments):
+        comment_lines.append(f"[{len(all_comments) - len(recent_comments)} earlier comments omitted]")
+    for comment in recent_comments:
+        author = (comment.get("user") or {}).get("login") or "unknown"
+        text = _clip(_sanitize_for_untrusted_block(comment.get("body") or ""), MAX_COMMENT_CHARS)
+        comment_lines.append(f"comment by {author}: {text}")
+    comments_text = _clip("\n".join(comment_lines), MAX_COMMENTS_TOTAL_CHARS)
     return (
         f"{UNTRUSTED_START}\n"
         f"title: {title}\n"
