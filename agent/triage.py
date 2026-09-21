@@ -5,7 +5,17 @@ import time
 
 import psycopg
 import requests
-from groq import APIConnectionError, BadRequestError, Groq, InternalServerError, RateLimitError
+from groq import (
+    APIConnectionError,
+    AuthenticationError,
+    BadRequestError,
+    Groq,
+    InternalServerError,
+    NotFoundError,
+    PermissionDeniedError,
+    RateLimitError,
+)
+from psycopg import errors as pg_errors
 
 from agent.heuristics import is_heuristically_flagged
 from agent.prompts import SYSTEM_PROMPT, build_user_prompt
@@ -24,6 +34,21 @@ TRANSIENT_ERRORS = (
     requests.exceptions.RequestException,
     psycopg.OperationalError,
 )
+FATAL_ERRORS = (
+    AuthenticationError,
+    PermissionDeniedError,
+    NotFoundError,
+    pg_errors.InsufficientPrivilege,
+    pg_errors.UndefinedTable,
+    pg_errors.UndefinedColumn,
+    tools.RepoNotAllowedError,
+)
+FATAL_GITHUB_STATUSES = (401, 403)
+
+
+class ClassificationError(Exception):
+    pass
+
 
 PROPOSE_DISPATCH = {
     "propose_add_labels": lambda dsn, rc, repo, num, args, initiator, flagged, issue, rationale=None, max_body_chars=None: tools.propose_add_labels(
@@ -40,19 +65,6 @@ PROPOSE_DISPATCH = {
         dsn, rc, repo, num, args["assignee"], initiator, heuristic_flagged=flagged, issue=issue, rationale=rationale
     ),
 }
-
-
-EMPTY_CLASSIFICATION = {
-    "labels_to_add": [],
-    "comment": None,
-    "close_reason": None,
-    "assign_to": None,
-    "rationale": None,
-}
-
-
-def _empty_classification(rationale: str) -> dict:
-    return {**EMPTY_CLASSIFICATION, "labels_to_add": [], "rationale": rationale}
 
 
 def _sanitize_classification(data) -> dict:
@@ -98,14 +110,24 @@ def _sanitize_classification(data) -> dict:
     }
 
 
-def _parse_classification(raw_text: str) -> dict:
+def _extract_json(raw_text: str):
     cleaned = raw_text.strip()
     if cleaned.startswith("```"):
         cleaned = cleaned.strip("`")
         if cleaned.startswith("json"):
             cleaned = cleaned[4:]
-    parsed = json.loads(cleaned)
-    return _sanitize_classification(parsed)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start == -1 or end <= start:
+            raise
+        return json.loads(cleaned[start : end + 1])
+
+
+def _parse_classification(raw_text: str) -> dict:
+    return _sanitize_classification(_extract_json(raw_text))
 
 
 def build_groq_clients(config: Config) -> list[Groq]:
@@ -174,13 +196,15 @@ def classify_issue(
             {"role": "user", "content": build_user_prompt(issue, repo_labels, assignable)},
         ],
     )
+    if not response.choices:
+        raise ClassificationError("model returned no choices")
     raw_text = response.choices[0].message.content
     if not raw_text:
-        return _empty_classification("empty model output")
+        raise ClassificationError("empty model output")
     try:
         return _parse_classification(raw_text)
-    except (json.JSONDecodeError, ValueError) as exc:
-        return _empty_classification(f"unparseable model output: {exc}")
+    except ValueError as exc:
+        raise ClassificationError(f"unparseable model output: {exc}") from exc
 
 
 def _is_transient(exc: Exception) -> bool:
@@ -191,6 +215,14 @@ def _is_transient(exc: Exception) -> bool:
             return True
         return exc.status_code == 403 and "rate limit" in exc.message.lower()
     return False
+
+
+def _is_fatal(exc: Exception) -> bool:
+    if _is_transient(exc):
+        return False
+    if isinstance(exc, FATAL_ERRORS):
+        return True
+    return isinstance(exc, GitHubAPIError) and exc.status_code in FATAL_GITHUB_STATUSES
 
 
 def _issue_label_names(issue: dict) -> set[str]:
@@ -291,6 +323,7 @@ def run_triage(
         outcome = "error"
         error_text = None
         defer = False
+        fatal = False
         try:
             if issue_number is None:
                 raise ValueError("issue summary is missing a 'number' field")
@@ -336,7 +369,8 @@ def run_triage(
         except Exception as exc:
             error_text = f"{type(exc).__name__}: {exc}"
             transient = _is_transient(exc)
-            if transient:
+            fatal = _is_fatal(exc)
+            if transient or fatal:
                 defer = True
             if isinstance(exc, RateLimitError):
                 rate_limited = True
@@ -349,6 +383,7 @@ def run_triage(
                     "outcome": "error",
                     "error": error_text,
                     "transient": transient,
+                    "fatal": fatal,
                 }
             )
 
@@ -357,6 +392,15 @@ def run_triage(
                 tools.record_triage_attempt(dsn, repo, issue_number, summary_hash, outcome, error_text)
             except Exception as exc:
                 print(f"warning: could not record the triage attempt for #{issue_number}: {exc}", file=sys.stderr)
+
+        if fatal:
+            print(
+                f"error: {error_text}. This is a configuration or permission problem, not a problem with "
+                f"#{issue_number}, so the run stopped and nothing was recorded for it. Fix the credential, "
+                "model name, or database grant and run again.",
+                file=sys.stderr,
+            )
+            break
 
         if rate_limited:
             print(
@@ -406,6 +450,8 @@ def main():
         print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(1)
     print(json.dumps(results, indent=2, default=str))
+    if any(result.get("fatal") for result in results):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

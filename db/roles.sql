@@ -43,3 +43,52 @@ DROP TRIGGER IF EXISTS audit_log_guard_truncate ON audit_log;
 CREATE TRIGGER audit_log_guard_truncate
     BEFORE TRUNCATE ON audit_log
     FOR EACH STATEMENT EXECUTE FUNCTION issueops_guard_audit_log();
+
+CREATE OR REPLACE FUNCTION issueops_guard_proposal_insert() RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+    IF pg_has_role(current_user, 'issueops_proposer', 'member')
+       AND NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = current_user AND rolsuper) THEN
+        IF NEW.status IS DISTINCT FROM 'pending'
+           OR NEW.approved_by IS NOT NULL
+           OR NEW.approved_at IS NOT NULL
+           OR NEW.executed_at IS NOT NULL
+           OR NEW.claimed_at IS NOT NULL
+           OR NEW.claimed_by IS NOT NULL
+           OR NEW.execution_started_at IS NOT NULL
+           OR NEW.failure_reason IS NOT NULL
+           OR NEW.rejected_by IS NOT NULL
+           OR NEW.rejected_at IS NOT NULL THEN
+            RAISE EXCEPTION 'proposer role % may only insert a plain pending proposal', current_user;
+        END IF;
+        NEW.created_at := now();
+    END IF;
+    RETURN NEW;
+END $$;
+
+DROP TRIGGER IF EXISTS pending_actions_guard_proposer_insert ON pending_actions;
+CREATE TRIGGER pending_actions_guard_proposer_insert
+    BEFORE INSERT ON pending_actions
+    FOR EACH ROW EXECUTE FUNCTION issueops_guard_proposal_insert();
+
+CREATE OR REPLACE FUNCTION issueops_guard_audit_insert() RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+    IF pg_has_role(current_user, 'issueops_proposer', 'member')
+       AND NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = current_user AND rolsuper) THEN
+        IF NEW.result_status IS NULL OR NOT (NEW.result_status = ANY (ARRAY['ok', 'error', 'proposed', 'deduped'])) THEN
+            RAISE EXCEPTION 'proposer role % may not write audit rows with result %', current_user, NEW.result_status;
+        END IF;
+        NEW.timestamp := now();
+    END IF;
+    RETURN NEW;
+END $$;
+
+DROP TRIGGER IF EXISTS audit_log_guard_proposer_insert ON audit_log;
+CREATE TRIGGER audit_log_guard_proposer_insert
+    BEFORE INSERT ON audit_log
+    FOR EACH ROW EXECUTE FUNCTION issueops_guard_audit_insert();
