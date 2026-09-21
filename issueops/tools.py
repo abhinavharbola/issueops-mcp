@@ -15,6 +15,8 @@ from issueops.heuristics import flag_matches, is_heuristically_flagged
 
 VALID_CLOSE_REASONS = {"completed", "not_planned", None}
 
+DEFAULT_LIST_LIMIT = 50
+MAX_LIST_LIMIT = 100
 DEFAULT_COMMENT_BODY_MAX_CHARS = 65536
 DEFAULT_MAX_PENDING_PER_ISSUE = 10
 DEFAULT_MAX_PENDING_PER_INITIATOR = 500
@@ -165,13 +167,37 @@ def _run_read_tool(dsn, tool_name, repo, issue_number, arguments, initiator, fn)
             raise
 
 
-def list_issues(dsn, read_client: GitHubReadClient, repo, initiator, state="open", labels=None, since=None, max_pages=20):
+def _validate_list_limit(limit):
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= MAX_LIST_LIMIT:
+        raise ValidationError(f"limit must be an integer between 1 and {MAX_LIST_LIMIT}")
+
+
+def _collect_bounded(pages, limit: int):
+    items = []
+    try:
+        for page in pages:
+            items.extend(page)
+            if len(items) > limit:
+                break
+    except PaginationLimitExceededError:
+        return items[:limit], True
+    return items[:limit], len(items) > limit
+
+
+def list_issues(
+    dsn, read_client: GitHubReadClient, repo, initiator, state="open", labels=None, since=None,
+    max_pages=20, limit=DEFAULT_LIST_LIMIT,
+):
     repo = normalize_repo(repo)
-    arguments = {"state": state, "labels": labels, "since": since}
-    return _run_read_tool(
-        dsn, "list_issues", repo, None, arguments, initiator,
-        lambda: read_client.list_issues(repo, state=state, labels=labels, since=since, max_pages=max_pages),
-    )
+    arguments = {"state": state, "labels": labels, "since": since, "limit": limit}
+
+    def collect():
+        _validate_list_limit(limit)
+        pages = read_client.iter_issue_pages(repo, state=state, labels=labels, since=since, max_pages=max_pages)
+        issues, truncated = _collect_bounded(pages, limit)
+        return {"issues": issues, "truncated": truncated}
+
+    return _run_read_tool(dsn, "list_issues", repo, None, arguments, initiator, collect)
 
 
 def list_issue_candidates(
@@ -217,13 +243,19 @@ def get_issue(dsn, read_client: GitHubReadClient, repo, issue_number, initiator,
     )
 
 
-def list_pull_requests(dsn, read_client: GitHubReadClient, repo, initiator, state="open"):
+def list_pull_requests(
+    dsn, read_client: GitHubReadClient, repo, initiator, state="open", max_pages=20, limit=DEFAULT_LIST_LIMIT,
+):
     repo = normalize_repo(repo)
-    arguments = {"state": state}
-    return _run_read_tool(
-        dsn, "list_pull_requests", repo, None, arguments, initiator,
-        lambda: read_client.list_pull_requests(repo, state=state),
-    )
+    arguments = {"state": state, "limit": limit}
+
+    def collect():
+        _validate_list_limit(limit)
+        pages = read_client.iter_pull_request_pages(repo, state=state, max_pages=max_pages)
+        pulls, truncated = _collect_bounded(pages, limit)
+        return {"pull_requests": pulls, "truncated": truncated}
+
+    return _run_read_tool(dsn, "list_pull_requests", repo, None, arguments, initiator, collect)
 
 
 def search_issues(dsn, read_client: GitHubReadClient, repo, query, initiator):

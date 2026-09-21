@@ -165,6 +165,9 @@ class GitHubReadClient(_BaseClient):
     def list_pull_requests(self, repo: str, state: str = "open"):
         return self._paginated_get(f"/repos/{repo}/pulls", {"state": state})
 
+    def iter_pull_request_pages(self, repo: str, state: str = "open", max_pages: int = 20):
+        return self._paginated_iter(f"/repos/{repo}/pulls", {"state": state}, max_pages=max_pages)
+
     def search_issues(self, repo: str, query: str):
         full_query = f"repo:{repo} {query}"
         data = self._request("GET", "/search/issues", params={"q": full_query, "per_page": 100})

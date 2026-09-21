@@ -468,7 +468,12 @@ def test_a_transient_failure_is_not_recorded_so_it_can_never_blacklist_an_issue(
 
 @pytest.mark.parametrize(
     "error",
-    [RuntimeError("bad"), triage.GitHubAPIError(404, "gone"), triage.GitHubAPIError(403, "forbidden")],
+    [
+        RuntimeError("bad"),
+        triage.GitHubAPIError(404, "gone"),
+        triage.GitHubAPIError(422, "unprocessable"),
+        triage.ClassificationError("empty model output"),
+    ],
 )
 def test_a_permanent_failure_is_still_recorded(monkeypatch, patched, error):
     _listing(monkeypatch, [{"number": 1, "title": "t", "body": "b"}])
@@ -478,7 +483,70 @@ def test_a_permanent_failure_is_still_recorded(monkeypatch, patched, error):
     results = triage.run_triage("owner/repo", "test")
 
     assert results[0]["transient"] is False
+    assert results[0]["fatal"] is False
     assert patched.call_args.args[4] == "error"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        _http_error(triage.AuthenticationError, 401),
+        _http_error(triage.PermissionDeniedError, 403),
+        _http_error(triage.NotFoundError, 404),
+        triage.GitHubAPIError(401, "bad credentials"),
+        triage.GitHubAPIError(403, "Resource not accessible by personal access token"),
+        triage.tools.RepoNotAllowedError("owner/repo not allowlisted"),
+        triage.pg_errors.InsufficientPrivilege("permission denied for table audit_log"),
+        triage.pg_errors.UndefinedTable("relation does not exist"),
+    ],
+)
+def test_a_systemic_failure_stops_the_run_and_never_blacklists_an_issue(monkeypatch, patched, capsys, error):
+    _listing(monkeypatch, [{"number": n, "title": "t", "body": "b"} for n in (1, 2, 3)])
+    monkeypatch.setattr(triage.tools, "get_issue", MagicMock(side_effect=lambda *a, **k: _issue(a[3])))
+    classify = MagicMock(side_effect=error)
+    monkeypatch.setattr(triage, "classify_issue", classify)
+
+    results = triage.run_triage("owner/repo", "test")
+
+    assert [r["issue_number"] for r in results] == [1]
+    assert results[0]["fatal"] is True
+    assert classify.call_count == 1
+    patched.assert_not_called()
+    assert "configuration or permission problem" in capsys.readouterr().err
+
+
+def test_a_github_rate_limit_403_is_transient_not_fatal(monkeypatch, patched):
+    _listing(monkeypatch, [{"number": 1, "title": "t", "body": "b"}, {"number": 2, "title": "t", "body": "b"}])
+    monkeypatch.setattr(triage.tools, "get_issue", MagicMock(side_effect=lambda *a, **k: _issue(a[3])))
+    monkeypatch.setattr(
+        triage, "classify_issue", MagicMock(side_effect=triage.GitHubAPIError(403, "API rate limit exceeded"))
+    )
+
+    results = triage.run_triage("owner/repo", "test")
+
+    assert [r["issue_number"] for r in results] == [1, 2]
+    assert all(r["fatal"] is False and r["transient"] is True for r in results)
+    patched.assert_not_called()
+
+
+def test_main_exits_nonzero_when_the_run_hit_a_systemic_failure(monkeypatch, capsys):
+    monkeypatch.setattr(triage, "run_triage", MagicMock(return_value=[{"issue_number": 1, "fatal": True}]))
+    monkeypatch.setattr(triage.sys, "argv", ["triage", "owner/repo"])
+
+    with pytest.raises(SystemExit) as exit_info:
+        triage.main()
+
+    assert exit_info.value.code == 1
+    assert '"fatal": true' in capsys.readouterr().out
+
+
+def test_main_exits_cleanly_when_nothing_was_fatal(monkeypatch, capsys):
+    monkeypatch.setattr(triage, "run_triage", MagicMock(return_value=[{"issue_number": 1, "outcome": "no_action"}]))
+    monkeypatch.setattr(triage.sys, "argv", ["triage", "owner/repo"])
+
+    triage.main()
+
+    assert '"no_action"' in capsys.readouterr().out
 
 
 def test_a_rate_limit_stops_the_run_instead_of_burning_the_remaining_issues(monkeypatch, patched, capsys):

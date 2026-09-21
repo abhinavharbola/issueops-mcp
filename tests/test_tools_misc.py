@@ -243,3 +243,124 @@ def test_get_issue_can_skip_comments(monkeypatch):
     tools.get_issue("dsn", read_client, "owner/repo", 4, "test", include_comments=False)
 
     read_client.get_issue.assert_called_once_with("owner/repo", 4, include_comments=False)
+
+
+def _numbered_pages(*sizes):
+    number = 0
+    pages = []
+    for size in sizes:
+        page = []
+        for _ in range(size):
+            number += 1
+            page.append({"number": number})
+        pages.append(page)
+    return pages
+
+
+def test_list_issues_returns_at_most_the_limit_and_says_when_it_cut_the_list(monkeypatch):
+    _use_conn(monkeypatch)
+    read_client = MagicMock()
+    read_client.iter_issue_pages.return_value = iter(_numbered_pages(100, 100))
+
+    result = tools.list_issues("dsn", read_client, "owner/repo", "test", limit=30)
+
+    assert [i["number"] for i in result["issues"]] == list(range(1, 31))
+    assert result["truncated"] is True
+
+
+def test_list_issues_does_not_fetch_more_pages_than_the_limit_needs(monkeypatch):
+    _use_conn(monkeypatch)
+    fetched = []
+
+    def pages():
+        for page in _numbered_pages(100, 100, 100):
+            fetched.append(page)
+            yield page
+
+    read_client = MagicMock()
+    read_client.iter_issue_pages.return_value = pages()
+
+    tools.list_issues("dsn", read_client, "owner/repo", "test", limit=50)
+
+    assert len(fetched) == 1
+
+
+def test_list_issues_is_not_truncated_when_everything_fits(monkeypatch):
+    _use_conn(monkeypatch)
+    read_client = MagicMock()
+    read_client.iter_issue_pages.return_value = iter(_numbered_pages(7))
+
+    result = tools.list_issues("dsn", read_client, "owner/repo", "test", limit=50)
+
+    assert len(result["issues"]) == 7
+    assert result["truncated"] is False
+
+
+def test_list_issues_is_not_truncated_when_the_count_equals_the_limit_exactly(monkeypatch):
+    _use_conn(monkeypatch)
+    read_client = MagicMock()
+    read_client.iter_issue_pages.return_value = iter(_numbered_pages(5))
+
+    result = tools.list_issues("dsn", read_client, "owner/repo", "test", limit=5)
+
+    assert len(result["issues"]) == 5
+    assert result["truncated"] is False
+
+
+def test_list_issues_flags_truncation_when_the_page_limit_is_hit_first(monkeypatch):
+    _use_conn(monkeypatch)
+    read_client = MagicMock()
+    read_client.iter_issue_pages.return_value = _pages_then_limit(_numbered_pages(10))
+
+    result = tools.list_issues("dsn", read_client, "owner/repo", "test", limit=50)
+
+    assert len(result["issues"]) == 10
+    assert result["truncated"] is True
+
+
+def test_list_issues_passes_filters_through_to_the_client(monkeypatch):
+    _use_conn(monkeypatch)
+    read_client = MagicMock()
+    read_client.iter_issue_pages.return_value = iter([[]])
+
+    tools.list_issues("dsn", read_client, " Owner/Repo ", "test", state="closed", labels=["bug"], since="2026-01-01T00:00:00Z")
+
+    read_client.iter_issue_pages.assert_called_once_with(
+        "owner/repo", state="closed", labels=["bug"], since="2026-01-01T00:00:00Z", max_pages=20,
+    )
+
+
+@pytest.mark.parametrize("limit", [0, -1, tools.MAX_LIST_LIMIT + 1, "5", True, None])
+def test_list_tools_reject_out_of_range_limits_before_calling_github(monkeypatch, limit):
+    _use_conn(monkeypatch)
+    read_client = MagicMock()
+
+    with pytest.raises(tools.ValidationError, match="limit"):
+        tools.list_issues("dsn", read_client, "owner/repo", "test", limit=limit)
+    with pytest.raises(tools.ValidationError, match="limit"):
+        tools.list_pull_requests("dsn", read_client, "owner/repo", "test", limit=limit)
+
+    read_client.iter_issue_pages.assert_not_called()
+    read_client.iter_pull_request_pages.assert_not_called()
+
+
+def test_list_pull_requests_is_bounded_and_reports_truncation(monkeypatch):
+    _use_conn(monkeypatch)
+    read_client = MagicMock()
+    read_client.iter_pull_request_pages.return_value = iter(_numbered_pages(100, 100))
+
+    result = tools.list_pull_requests("dsn", read_client, "Owner/Repo", "test", state="all", limit=20)
+
+    assert [p["number"] for p in result["pull_requests"]] == list(range(1, 21))
+    assert result["truncated"] is True
+    read_client.iter_pull_request_pages.assert_called_once_with("owner/repo", state="all", max_pages=20)
+
+
+def test_a_rejected_limit_is_recorded_as_an_error_in_the_audit_log(monkeypatch):
+    conn = _use_conn(monkeypatch)
+
+    with pytest.raises(tools.ValidationError):
+        tools.list_issues("dsn", MagicMock(), "owner/repo", "test", limit=0)
+
+    audit_inserts = [q for q in conn.queries if "INSERT INTO audit_log" in q[0]]
+    assert audit_inserts and audit_inserts[-1][1][6] == "error"

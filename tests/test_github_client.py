@@ -280,3 +280,32 @@ def test_get_issue_comments_partial_mode_returns_what_was_read_instead_of_raisin
     assert len(comments) == 2
     with pytest.raises(PaginationLimitExceededError):
         client.get_issue_comments("o/r", 1, max_pages=2)
+
+
+def test_iter_pull_request_pages_requests_the_pulls_endpoint_page_by_page():
+    client = GitHubReadClient("fake-pat")
+    page1 = _mock_response(
+        200, json_data=[{"number": 1}],
+        headers={"Link": '<https://api.github.com/repos/o/r/pulls?page=2>; rel="next"'},
+    )
+    page2 = _mock_response(200, json_data=[{"number": 2}])
+    client._session.request = MagicMock(side_effect=[page1, page2])
+
+    pages = list(client.iter_pull_request_pages("o/r", state="all"))
+
+    assert pages == [[{"number": 1}], [{"number": 2}]]
+    first_call = client._session.request.call_args_list[0]
+    assert first_call.args[:2] == ("GET", "https://api.github.com/repos/o/r/pulls")
+    assert first_call.kwargs["params"]["state"] == "all"
+
+
+def test_iter_pull_request_pages_raises_when_the_page_limit_is_exceeded():
+    client = GitHubReadClient("fake-pat")
+    always_next = _mock_response(
+        200, json_data=[{"number": 1}],
+        headers={"Link": '<https://api.github.com/repos/o/r/pulls?page=2>; rel="next"'},
+    )
+    client._session.request = MagicMock(return_value=always_next)
+
+    with pytest.raises(PaginationLimitExceededError):
+        list(client.iter_pull_request_pages("o/r", max_pages=2))

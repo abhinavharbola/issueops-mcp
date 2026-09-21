@@ -805,7 +805,10 @@ def test_successive_triage_runs_advance_through_issues_that_need_no_action(dsn, 
     monkeypatch.setattr(triage, "configure_logfire", MagicMock())
     monkeypatch.setattr(triage, "GitHubReadClient", MagicMock(return_value=read_client))
     monkeypatch.setattr(triage, "build_groq_clients", MagicMock(return_value=["c"]))
-    monkeypatch.setattr(triage, "classify_issue", MagicMock(return_value=triage._empty_classification("nothing to do")))
+    nothing_to_do = {
+        "labels_to_add": [], "comment": None, "close_reason": None, "assign_to": None, "rationale": "nothing to do",
+    }
+    monkeypatch.setattr(triage, "classify_issue", MagicMock(return_value=nothing_to_do))
 
     touched = [
         [r["issue_number"] for r in triage.run_triage("owner/repo", "agent:cli", max_issues=2)]
@@ -932,6 +935,114 @@ def test_the_proposer_role_can_queue_and_record_triage_but_nothing_else(roles_ds
         for sql in forbidden:
             with pytest.raises(psycopg.errors.InsufficientPrivilege):
                 conn.execute(sql)
+
+
+_PROPOSAL_COLUMNS = "tool_name, repo, issue_number, arguments, issue_state_snapshot, requested_by"
+_PROPOSAL_VALUES = "'propose_close', 'owner/repo', 1, '{}', '{}', 'mcp:test'"
+
+
+@pytest.mark.parametrize(
+    "extra_columns, extra_values",
+    [
+        (", status", ", 'executed'"),
+        (", status", ", 'approving'"),
+        (", approved_by", ", 'alice'"),
+        (", approved_at", ", now()"),
+        (", executed_at", ", now()"),
+        (", claimed_at", ", now()"),
+        (", claimed_by", ", 'alice'"),
+        (", execution_started_at", ", now()"),
+        (", failure_reason", ", 'x'"),
+        (", rejected_by", ", 'alice'"),
+        (", rejected_at", ", now()"),
+    ],
+)
+def test_the_proposer_role_cannot_insert_a_proposal_that_claims_to_be_past_the_pending_state(
+    roles_dsn, extra_columns, extra_values,
+):
+    import psycopg
+
+    proposer = _role_dsn(roles_dsn, "issueops_proposer")
+
+    with tools.sync_connection(proposer) as conn:
+        with pytest.raises(psycopg.errors.RaiseException):
+            conn.execute(
+                f"INSERT INTO pending_actions ({_PROPOSAL_COLUMNS}{extra_columns}) "
+                f"VALUES ({_PROPOSAL_VALUES}{extra_values})"
+            )
+
+    assert _count(roles_dsn, "SELECT count(*) AS n FROM pending_actions") == 0
+
+
+@pytest.mark.parametrize("forged_status", ["executed", "rejected", "claimed", "stale", "failed", "needs_review", "expired"])
+def test_the_proposer_role_cannot_write_audit_rows_that_look_like_an_approval_outcome(roles_dsn, forged_status):
+    import psycopg
+
+    proposer = _role_dsn(roles_dsn, "issueops_proposer")
+
+    with tools.sync_connection(proposer) as conn:
+        with pytest.raises(psycopg.errors.RaiseException):
+            conn.execute(
+                "INSERT INTO audit_log (tool_name, initiator, result_status) VALUES ('propose_close', 'alice', %s)",
+                (forged_status,),
+            )
+
+    assert _count(roles_dsn, "SELECT count(*) AS n FROM audit_log WHERE initiator = 'alice'") == 0
+
+
+def test_the_proposer_role_can_still_write_the_audit_statuses_it_needs_and_cannot_backdate_rows(roles_dsn):
+    proposer = _role_dsn(roles_dsn, "issueops_proposer")
+
+    with tools.sync_connection(proposer) as conn:
+        for status in ("ok", "error", "proposed", "deduped"):
+            conn.execute(
+                "INSERT INTO audit_log (tool_name, initiator, result_status, timestamp) "
+                "VALUES ('t', 'i', %s, now() - interval '400 days')",
+                (status,),
+            )
+        conn.execute(
+            f"INSERT INTO pending_actions ({_PROPOSAL_COLUMNS}, created_at) "
+            f"VALUES ({_PROPOSAL_VALUES}, now() - interval '400 days')"
+        )
+
+    assert _count(roles_dsn, "SELECT count(*) AS n FROM audit_log WHERE timestamp > now() - interval '1 day'") == 4
+    assert _count(roles_dsn, "SELECT count(*) AS n FROM pending_actions WHERE created_at > now() - interval '1 day'") == 1
+
+
+def test_a_forged_executed_row_from_the_proposer_cannot_satisfy_the_audit_consistency_check(roles_dsn):
+    import psycopg
+
+    pytest.importorskip("groq")
+    import eval.eval as ev
+
+    proposer = _role_dsn(roles_dsn, "issueops_proposer")
+
+    with tools.sync_connection(proposer) as conn:
+        with pytest.raises(psycopg.errors.RaiseException):
+            conn.execute(
+                f"INSERT INTO pending_actions ({_PROPOSAL_COLUMNS}, status, approved_by, executed_at) "
+                f"VALUES ({_PROPOSAL_VALUES}, 'executed', 'alice', now())"
+            )
+        with pytest.raises(psycopg.errors.RaiseException):
+            conn.execute(
+                "INSERT INTO audit_log (tool_name, initiator, result_status) VALUES ('propose_close', 'alice', 'executed')"
+            )
+
+    assert ev.check_audit_consistency(roles_dsn) == {
+        "audit_rows_without_an_approved_action": 0,
+        "executed_actions_without_an_audit_row": 0,
+    }
+
+
+def test_the_superuser_and_owner_path_is_not_restricted_by_the_proposer_guards(roles_dsn):
+    with tools.sync_connection(roles_dsn) as conn:
+        conn.execute(
+            f"INSERT INTO pending_actions ({_PROPOSAL_COLUMNS}, status, approved_by) "
+            f"VALUES ({_PROPOSAL_VALUES}, 'executed', 'alice')"
+        )
+        conn.execute("INSERT INTO audit_log (tool_name, initiator, result_status) VALUES ('t', 'i', 'executed')")
+
+    assert _count(roles_dsn, "SELECT count(*) AS n FROM pending_actions WHERE status = 'executed'") == 1
 
 
 def test_the_approver_role_can_approve_and_read_but_cannot_rewrite_the_log_or_queue_proposals(roles_dsn):
