@@ -151,4 +151,18 @@ CREATE INDEX IF NOT EXISTS idx_pending_actions_approving ON pending_actions (cla
 CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log (timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_log_pending_action ON audit_log (pending_action_id);
 
+-- schema_migrations records which files under db/migrations/ a database has applied,
+-- so this idempotent bootstrap script and the incremental migration runner
+-- (scripts/migrate.py) share one source of truth instead of two unreconciled ones.
+-- Every column and constraint that 001_hardening.sql and 002_needs_review.sql add is
+-- already included above, so running this script (fresh install or upgrade) means both
+-- are satisfied; back-fill them here so scripts/migrate.py does not try to re-run them
+-- and only applies migration files added after this one.
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version TEXT PRIMARY KEY,
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
+INSERT INTO schema_migrations (version)
+VALUES ('001_hardening.sql'), ('002_needs_review.sql')
+ON CONFLICT (version) DO NOTHING;

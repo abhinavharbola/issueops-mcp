@@ -77,7 +77,7 @@ Each process is started separately and loads only the credentials it needs, from
 - **Trusted context:** the classifier is told the issue's state, current labels and assignees, the labels that exist on the repo, and who can be assigned. Untrusted issue text is passed separately, inside delimiters.
 - **Allowed proposals:** by default the agent only proposes labels and assignments. Free-text comments need `--allow-comment` and closes need `--allow-close`, because a comment body is the natural payload for a prompt-injected issue. Even with the flags on, an issue that trips the injection phrase check gets labels and assignments only.
 - **Plan filtering:** proposals for labels already on the issue, labels not on the repo, assignees who are already assigned or not assignable, and closes on issues that are not open are dropped before anything is queued.
-- **Memory:** issues that already have an agent proposal in status `pending`, `approving`, `rejected`, or `executed` are skipped on later runs. `needs_review` proposals count as handled. `expired`, `failed`, and `stale` proposals do not count, so those issues are re-evaluated. Every issue the agent looks at is also recorded in `triage_attempts`. An issue where the model proposed nothing is skipped until its title or body changes. Empty or unparseable model output is not treated as "nothing to propose": it is an error, so it is retried up to 3 times like any other per-issue error, and JSON wrapped in prose is recovered when possible. Only deterministic per-issue errors count toward those 3 tries. Provider rate limits, timeouts, connection failures, database connection failures, and GitHub 5xx, 429 or rate limit 403 responses are transient: they are not recorded, so an outage or an exhausted free-tier quota never blacklists an issue. Systemic failures are handled separately: a rejected or revoked Groq key, a model that no longer exists, a GitHub 401 or non-rate-limit 403, a repo that is no longer allowlisted, and a missing database grant or table stop the run at the first occurrence, record nothing for the issue, print the cause, and exit with status 1, so a broken configuration cannot retire issues one by one. Without this, issues that need no action would fill the `--max-issues` slots on every run and later issues would never be reached.
+- **Memory:** issues that already have an agent proposal in status `pending`, `approving`, `rejected`, or `executed` are skipped on later runs. `needs_review` proposals count as handled. `expired`, `failed`, and `stale` proposals do not count, so those issues are re-evaluated. Every issue the agent looks at is also recorded in `triage_attempts`. An issue where the model proposed nothing, or where every proposal it produced deduplicated against an already-pending action (including one queued by a human or an MCP client, not just the agent's own), is skipped on later runs until its title or body changes. Empty or unparseable model output is not treated as "nothing to propose": it is an error, so it is retried up to 3 times like any other per-issue error, and JSON wrapped in prose is recovered when possible. Only deterministic per-issue errors count toward those 3 tries. Provider rate limits, timeouts, connection failures, database connection failures, and GitHub 5xx, 429 or rate limit 403 responses are transient: they are not recorded, so an outage or an exhausted free-tier quota never blacklists an issue. Systemic failures are handled separately: a rejected or revoked Groq key, a model that no longer exists, a GitHub 401 or non-rate-limit 403, a repo that is no longer allowlisted, and a missing database grant or table stop the run at the first occurrence, record nothing for the issue, print the cause, and exit with status 1, so a broken configuration cannot retire issues one by one. Without this, issues that need no action would fill the `--max-issues` slots on every run and later issues would never be reached.
 - **Rate limits:** when the model provider is still rate limiting after the built-in retry, the run stops instead of spending the rest of the issues on failed calls.
 - **Full queue:** if a proposal is refused because the initiator's queue is full, the run stops instead of spending model calls on issues it cannot queue, and those issues are not recorded so they are retried next time.
 - **Rationale:** the model's rationale is stored with each proposal and shown to the approver.
@@ -136,7 +136,7 @@ issueops-mcp/
 │
 ├── db/
 │   ├── schema.sql               # idempotent: creates a fresh database or upgrades an existing one
-│   └── migrations/             # the same changes as separate steps
+│   └── migrations/             # incremental changes, applied and tracked by scripts/migrate.py
 │
 ├── eval/
 │   ├── eval.py                  # classification, adversarial, and audit-consistency checks
@@ -144,6 +144,7 @@ issueops-mcp/
 │
 ├── scripts/
 │   ├── allowlist.py             # add, deactivate, list allowlisted repos
+│   ├── migrate.py               # applies db/migrations/*.sql not yet recorded in schema_migrations
 │   ├── prune_audit_log.py       # delete audit rows older than N days
 │   └── custom_client.py         # call one MCP tool from the command line
 │
@@ -171,7 +172,11 @@ issueops-mcp/
    cp .env.example .env   # fill in every key you have; leave the rest blank
    ```
 
-3. **Database**, no local `psql` needed. Open your Neon project's **SQL Editor**, paste in [`db/schema.sql`](db/schema.sql), and run it. The script is idempotent, so the same file creates a fresh database and upgrades an existing one. It is safe to run again after pulling new versions.
+3. **Database**, no local `psql` needed. Open your Neon project's **SQL Editor**, paste in [`db/schema.sql`](db/schema.sql), and run it once. The script is idempotent, so the same file creates a fresh database or upgrades an existing one, and it records every file under `db/migrations/` as applied in a `schema_migrations` table so they are not reapplied. After the initial run, pull new versions of this repo and apply any migration files added later with:
+   ```
+   python scripts/migrate.py
+   ```
+   `schema_migrations` is the single source of truth for what a database has applied; `db/schema.sql` and `db/migrations/*.sql` no longer need to be reconciled by hand.
 
 4. **Allowlist a repo.** Nothing works on a repo until this is done.
    ```
@@ -226,7 +231,11 @@ In the dashboard, enter the access token and your name in the sidebar, expand a 
 
 ## Testing
 
-Run `pytest` from the repo root.
+Install the dev dependencies once (`pytest` is not required at runtime, so it is not in `requirements.txt`), then run `pytest` from the repo root:
+```
+pip install -r requirements-dev.txt
+pytest
+```
 
 Most tests use the fake database in `conftest.py` to check SQL call sequences, and mocks for the GitHub clients. Those cannot verify locking. `tests/test_integration_postgres.py` runs against a real Postgres and covers concurrent approvals, lease reclamation, concurrent dedup, queue caps under concurrent proposals, deadlock freedom, atomic audit writes, retry after a dropped connection, triage memory, and the schema upgrade from a legacy database. `tests/test_dashboard.py` drives the dashboard headlessly, and its database-backed cases use the same variable. Both are skipped unless `TEST_DATABASE_URL` points at a scratch database. Each test creates and drops its own schema, and CI runs them against a Postgres service container.
 
@@ -246,7 +255,7 @@ No labeled dataset is shipped, only the template.
 
 ## Known limitations
 
-- The injection heuristic is advisory. An attacker only has to avoid the listed phrases.
+- The injection heuristic is advisory. An attacker only has to avoid the listed phrases. It is checked both against the text stored at proposal time and, when the approver clicks **Load current issue from GitHub**, against that live text, so an issue edited to add injection content after being queued still requires the acknowledgment checkbox. Neither check is a security boundary.
 - Approver identity in the dashboard is a typed name, not authentication. The access token gates the app but does not tell approvers apart.
 - Recovery of a row stuck in `approving` runs on dashboard page loads, not in a background worker, and it is time-based rather than a liveness check. A row whose GitHub call had started moves to `needs_review`, and if the original call was only slow, its result is reported as `lost_lease_after_execution`. Either way a person must check GitHub and resolve it in the dashboard. A resolution is the resolver's word, recorded in the audit log, and is not verified against GitHub.
 - The stale check does not cover new comments or edits to existing comments. The approver sees the comments as they were at proposal time and can load the current ones. A `stale` or `failed` action is terminal, so the agent can re-propose it on a later run but a person cannot retry it. A GitHub read failure during approval is not terminal: the row is released back to `pending`.

@@ -386,12 +386,19 @@ TRIAGE_OUTCOMES = ("proposed", "no_action", "error")
 
 
 def list_triage_skips(dsn, repo: str, max_error_attempts: int = DEFAULT_MAX_ERROR_ATTEMPTS) -> dict[int, str]:
+    # 'proposed' is included here, not just 'no_action', because a triage attempt can
+    # resolve to 'proposed' purely by deduping against a pending_actions row that some
+    # other initiator (a human, an MCP client) already queued. list_handled_issue_numbers
+    # only tracks rows the agent itself owns (requested_by LIKE 'agent:%'), so a
+    # dedup-only 'proposed' outcome is invisible there and, without this, the agent would
+    # re-classify the same unchanged issue with the model on every run forever.
     repo = normalize_repo(repo)
     with sync_connection(dsn) as conn:
         rows = conn.execute(
             """
             SELECT issue_number, content_hash FROM triage_attempts
-            WHERE repo = %s AND (outcome = 'no_action' OR (outcome = 'error' AND attempts >= %s))
+            WHERE repo = %s
+              AND (outcome IN ('no_action', 'proposed') OR (outcome = 'error' AND attempts >= %s))
             """,
             (repo, max_error_attempts),
         ).fetchall()
@@ -784,5 +791,3 @@ def propose_close(dsn, read_client, repo, issue_number, reason, initiator, heuri
         rationale=rationale,
     )
     return {"id": action_id, "preview": f"Close {repo}#{issue_number}: {preview}"}
-
-

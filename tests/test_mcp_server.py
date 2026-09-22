@@ -52,6 +52,18 @@ def test_an_unrelated_exception_is_left_unchanged(server_module):
         boom()
 
 
+def test_a_database_error_becomes_a_tool_error(server_module):
+    import psycopg
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    @server_module._translate_errors
+    def boom():
+        raise psycopg.OperationalError("connection refused")
+
+    with pytest.raises(ToolError):
+        boom()
+
+
 
 def test_initiator_falls_back_to_hostname_and_pid_when_no_label_is_set(server_module):
     assert server_module.initiator.startswith("mcp:stdio:")

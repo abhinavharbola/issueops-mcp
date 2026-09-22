@@ -2,6 +2,7 @@ import os
 import socket
 from functools import wraps
 
+import psycopg
 import requests
 
 from mcp.server.mcpserver import MCPServer
@@ -34,6 +35,14 @@ def _translate_errors(fn):
             raise ToolError(str(exc)) from exc
         except requests.exceptions.RequestException as exc:
             raise ToolError(f"GitHub API request failed: {exc}") from exc
+        except psycopg.Error as exc:
+            # A database failure is an expected external-infra category, same as
+            # GitHubAPIError/RequestException above, so it gets the same translation.
+            # Anything else is left to propagate raw and untranslated on purpose
+            # (see test_an_unrelated_exception_is_left_unchanged): masking a genuine
+            # programming bug behind a generic ToolError would hide it instead of
+            # surfacing it loudly in the server's own logs.
+            raise ToolError(f"database error: {exc}") from exc
 
     return wrapper
 
@@ -147,5 +156,3 @@ def propose_close(repo: str, issue_number: int, reason: str | None = None):
 
 if __name__ == "__main__":
     server.run()
-
-

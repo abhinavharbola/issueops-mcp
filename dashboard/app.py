@@ -11,6 +11,7 @@ from issueops import actions, tools
 from issueops.config import load_config
 from issueops.db import sync_connection
 from issueops.github_client import GitHubReadClient, GitHubWriteClient
+from issueops.heuristics import flag_matches
 from issueops.observability import configure_logfire
 
 PAGE_SIZE = 25
@@ -97,7 +98,17 @@ with sync_connection(config.neon_dsn) as conn:
     total_needs_review = actions.count_needs_review(conn)
 
 page_count = max(1, math.ceil(total_pending / PAGE_SIZE))
-page = st.sidebar.number_input("Page", min_value=1, max_value=page_count, value=1, step=1)
+# A stable, explicit key keeps the selected page across reruns. Without one, Streamlit
+# derives the widget's identity partly from max_value, which changes every time an
+# action is approved or rejected, so the selection would silently reset to page 1 on
+# the very next rerun. Clamp any stored value before instantiating the widget, since
+# max_value can shrink below a previously chosen page once actions are resolved, and
+# Streamlit raises rather than clamping automatically.
+if st.session_state.get("dashboard_page", 1) > page_count:
+    st.session_state["dashboard_page"] = page_count
+page = st.sidebar.number_input(
+    "Page", min_value=1, max_value=page_count, value=1, step=1, key="dashboard_page"
+)
 st.sidebar.caption(f"{total_pending} pending action(s), {PAGE_SIZE} per page")
 if total_needs_review:
     st.sidebar.warning(f"{total_needs_review} action(s) need review: outcome unknown")
@@ -171,6 +182,7 @@ else:
                     st.session_state[preview_key] = {"error": str(exc)}
 
             preview = st.session_state.get(preview_key)
+            live_flag_matches = []
             if preview is not None:
                 if "error" in preview:
                     st.warning(f"could not fetch source issue: {preview['error']}")
@@ -181,9 +193,19 @@ else:
                     for comment in (preview.get("comments_detail") or [])[-10:]:
                         author = (comment.get("user") or {}).get("login") or "unknown"
                         st.text(f"comment by {author}: {comment.get('body') or ''}")
+                    # heuristic_flagged is decided once, at proposal time, and stored on
+                    # the row. The issue can be edited afterward to add injection content,
+                    # and the button above fetches that live text, so re-run the same
+                    # check against it rather than trusting the stale, stored flag alone.
+                    live_flag_matches = flag_matches(tools.issue_plaintext(preview))
+                    if live_flag_matches:
+                        st.error(
+                            "The current issue text (fetched just now) contains phrases that look "
+                            "like prompt injection: " + ", ".join(live_flag_matches)
+                        )
 
             acknowledged = True
-            if row["heuristic_flagged"]:
+            if row["heuristic_flagged"] or live_flag_matches:
                 acknowledged = st.checkbox(
                     "I read the flagged issue text and still want to act on this",
                     key=f"ack_{row['id']}",
@@ -259,5 +281,3 @@ st.subheader("Recent audit log")
 with sync_connection(config.neon_dsn) as conn:
     audit_rows = actions.list_recent_audit_log(conn)
 st.dataframe(audit_rows, use_container_width=True)
-
-

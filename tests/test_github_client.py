@@ -309,5 +309,3 @@ def test_iter_pull_request_pages_raises_when_the_page_limit_is_exceeded():
 
     with pytest.raises(PaginationLimitExceededError):
         list(client.iter_pull_request_pages("o/r", max_pages=2))
-
-
