@@ -753,12 +753,15 @@ def test_the_stored_excerpt_is_bounded(dsn):
     assert len(excerpt["comments"][0]["body"]) < tools.EXCERPT_COMMENT_CHARS + 50
 
 
-def test_triage_attempts_skip_unchanged_no_action_issues_but_reconsider_edited_ones(dsn):
+def test_triage_attempts_skip_unchanged_issues_but_reconsider_edited_ones(dsn):
     digest = tools.content_hash("t", "b")
     tools.record_triage_attempt(dsn, "owner/repo", 1, digest, "no_action")
     tools.record_triage_attempt(dsn, "owner/repo", 2, digest, "proposed")
 
-    assert tools.list_triage_skips(dsn, "owner/repo") == {1: digest}
+    # 'proposed' counts as unchanged here too, not just 'no_action': see the
+    # comment on list_triage_skips for why a dedup-only 'proposed' outcome must
+    # also be skipped on future runs.
+    assert tools.list_triage_skips(dsn, "owner/repo") == {1: digest, 2: digest}
 
     read_client = MagicMock()
     read_client.iter_issue_pages.return_value = [[
@@ -768,7 +771,7 @@ def test_triage_attempts_skip_unchanged_no_action_issues_but_reconsider_edited_o
     ]]
     unchanged = tools.list_triage_skips(dsn, "owner/repo")
     result = tools.list_issue_candidates(dsn, read_client, "owner/repo", "agent:test", unchanged=unchanged)
-    assert [i["number"] for i in result["issues"]] == [2, 3]
+    assert [i["number"] for i in result["issues"]] == [3]
 
     read_client.iter_issue_pages.return_value = [[{"number": 1, "title": "t", "body": "edited"}]]
     result = tools.list_issue_candidates(dsn, read_client, "owner/repo", "agent:test", unchanged=unchanged)
