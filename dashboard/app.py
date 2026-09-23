@@ -1,15 +1,17 @@
 import math
 import os
 import sys
+from contextlib import contextmanager
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import streamlit as st
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 
 from dashboard import auth
 from issueops import actions, tools
 from issueops.config import load_config
-from issueops.db import sync_connection
 from issueops.github_client import GitHubReadClient, GitHubWriteClient
 from issueops.heuristics import flag_matches
 from issueops.observability import configure_logfire
@@ -22,6 +24,28 @@ config = load_config(require_write_pat=True)
 configure_logfire(config.logfire_token, service_name="issueops-dashboard")
 read_client = GitHubReadClient(config.github_read_pat)
 write_client = GitHubWriteClient(config.github_write_pat)
+
+
+@st.cache_resource
+def _get_pool(dsn: str) -> ConnectionPool:
+    # st.cache_resource keeps this pool alive across reruns and across every
+    # session served by this process, instead of a fresh psycopg.connect(...)
+    # (a full TCP+TLS+auth handshake to Neon) on every button click, checkbox
+    # toggle, or expander open. min_size keeps a connection warm at all times;
+    # max_size bounds how many concurrent checkouts this dashboard can hold.
+    return ConnectionPool(
+        dsn,
+        min_size=1,
+        max_size=5,
+        kwargs={"autocommit": True, "row_factory": dict_row},
+        open=True,
+    )
+
+
+@contextmanager
+def _connection():
+    with _get_pool(config.neon_dsn).connection() as conn:
+        yield conn
 
 
 def _enforce_access():
@@ -91,7 +115,7 @@ if "last_action_result" in st.session_state:
     else:
         st.error(f"Not executed: {result}")
 
-with sync_connection(config.neon_dsn) as conn:
+with _connection() as conn:
     actions.expire_stale_pending(conn, ttl_hours=config.pending_action_ttl_hours)
     actions.recover_stuck_approving(conn, minutes=config.stuck_approving_recovery_minutes)
     total_pending = actions.count_pending_actions(conn)
@@ -113,7 +137,7 @@ st.sidebar.caption(f"{total_pending} pending action(s), {PAGE_SIZE} per page")
 if total_needs_review:
     st.sidebar.warning(f"{total_needs_review} action(s) need review: outcome unknown")
 
-with sync_connection(config.neon_dsn) as conn:
+with _connection() as conn:
     pending = actions.list_pending_actions(conn, limit=PAGE_SIZE, offset=(int(page) - 1) * PAGE_SIZE)
 
 if not pending:
@@ -215,7 +239,7 @@ else:
             with col1:
                 if st.button("Approve", key=f"approve_{row['id']}", disabled=not (approver and acknowledged)):
                     try:
-                        with sync_connection(config.neon_dsn) as conn:
+                        with _connection() as conn:
                             result = actions.approve_action(
                                 conn, read_client, write_client, row["id"], approver,
                                 ttl_hours=config.pending_action_ttl_hours, dsn=config.neon_dsn,
@@ -228,7 +252,7 @@ else:
             with col2:
                 if st.button("Reject", key=f"reject_{row['id']}", disabled=not approver):
                     try:
-                        with sync_connection(config.neon_dsn) as conn:
+                        with _connection() as conn:
                             result = actions.reject_action(conn, row["id"], approver)
                     except Exception as exc:
                         result = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
@@ -242,7 +266,7 @@ else:
 
 def _resolve(action_id, applied):
     try:
-        with sync_connection(config.neon_dsn) as conn:
+        with _connection() as conn:
             result = actions.resolve_needs_review(conn, action_id, approver, applied)
     except Exception as exc:
         result = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
@@ -250,7 +274,7 @@ def _resolve(action_id, applied):
     st.rerun()
 
 
-with sync_connection(config.neon_dsn) as conn:
+with _connection() as conn:
     review_rows = actions.list_needs_review(conn)
 
 if review_rows:
@@ -278,7 +302,7 @@ if review_rows:
 
 st.divider()
 st.subheader("Recent audit log")
-with sync_connection(config.neon_dsn) as conn:
+with _connection() as conn:
     audit_rows = actions.list_recent_audit_log(conn)
 st.dataframe(audit_rows, use_container_width=True)
 
