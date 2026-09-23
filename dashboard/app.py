@@ -140,125 +140,137 @@ if total_needs_review:
 with _connection() as conn:
     pending = actions.list_pending_actions(conn, limit=PAGE_SIZE, offset=(int(page) - 1) * PAGE_SIZE)
 
+@st.fragment
+def _render_pending_row(row):
+    # Scoped to just this row. Expanding it, clicking "Load current issue", and
+    # ticking the acknowledgement checkbox only rerun this fragment, not the whole
+    # page, so they no longer re-run the DB queries above or re-render every other
+    # row. Approve and Reject still call plain st.rerun(), whose default scope is
+    # "app" even from inside a fragment, so those two correctly force a full page
+    # rerun -- they change the pending list, the counts, and the audit log below,
+    # all of which live outside this fragment.
+    preview_key = f"preview_{row['id']}"
+    header = f"{row['tool_name']} on {row['repo']}#{row['issue_number']}"
+    if row["heuristic_flagged"]:
+        header += "  [heuristic flag: advisory only, not a security boundary]"
+
+    with st.expander(header, expanded=preview_key in st.session_state):
+        st.write("Arguments")
+        st.json(row["arguments"])
+
+        if row.get("rationale"):
+            st.write("Why the proposer suggested this")
+            st.text(row["rationale"])
+
+        excerpt = row.get("source_excerpt")
+        if excerpt:
+            if excerpt.get("flag_matches"):
+                st.warning(
+                    "The issue text contains phrases that look like prompt injection: "
+                    + ", ".join(excerpt["flag_matches"])
+                )
+            if excerpt.get("flag_matches_not_shown"):
+                st.error(
+                    "These phrases appear in issue text that is NOT stored or shown here: "
+                    + ", ".join(excerpt["flag_matches_not_shown"])
+                    + ". Load the current issue and read it before acting."
+                )
+            if excerpt.get("text_truncated"):
+                st.caption(
+                    "Part of the title, body, or a comment was cut to fit storage. Load the current issue "
+                    "to read the rest."
+                )
+            if not str(row["requested_by"]).startswith("agent:"):
+                st.caption(
+                    "This came from an MCP client, which may have read more of the issue than is stored here."
+                )
+            st.write("Issue text stored with this proposal")
+            st.text(excerpt.get("title") or "(no title)")
+            st.text(excerpt.get("body") or "(no body)")
+            if excerpt.get("comments_omitted"):
+                st.caption(f"{excerpt['comments_omitted']} earlier comment(s) not shown")
+            if excerpt.get("comments_truncated_by_fetcher"):
+                st.caption("The comment list was cut off at the fetch limit")
+            for comment in excerpt.get("comments", []):
+                st.text(f"comment by {comment['author']}: {comment['body']}")
+        else:
+            st.caption("No issue text was stored with this proposal. Use the live view below.")
+
+        st.write("Snapshot at proposal time")
+        st.json(row["issue_state_snapshot"])
+
+        st.caption(f"Proposed by {row['requested_by']} at {row['created_at']}")
+
+        if st.button("Load current issue from GitHub", key=f"load_{row['id']}"):
+            try:
+                st.session_state[preview_key] = tools.get_issue(
+                    config.neon_dsn, read_client, row["repo"], row["issue_number"],
+                    "dashboard:preview", include_comments=True,
+                )
+            except Exception as exc:
+                st.session_state[preview_key] = {"error": str(exc)}
+
+        preview = st.session_state.get(preview_key)
+        live_flag_matches = []
+        if preview is not None:
+            if "error" in preview:
+                st.warning(f"could not fetch source issue: {preview['error']}")
+            else:
+                st.write("Current issue")
+                st.text(preview.get("title", ""))
+                st.text(preview.get("body") or "(no body)")
+                for comment in (preview.get("comments_detail") or [])[-10:]:
+                    author = (comment.get("user") or {}).get("login") or "unknown"
+                    st.text(f"comment by {author}: {comment.get('body') or ''}")
+                # heuristic_flagged is decided once, at proposal time, and stored on
+                # the row. The issue can be edited afterward to add injection content,
+                # and the button above fetches that live text, so re-run the same
+                # check against it rather than trusting the stale, stored flag alone.
+                live_flag_matches = flag_matches(tools.issue_plaintext(preview))
+                if live_flag_matches:
+                    st.error(
+                        "The current issue text (fetched just now) contains phrases that look "
+                        "like prompt injection: " + ", ".join(live_flag_matches)
+                    )
+
+        acknowledged = True
+        if row["heuristic_flagged"] or live_flag_matches:
+            acknowledged = st.checkbox(
+                "I read the flagged issue text and still want to act on this",
+                key=f"ack_{row['id']}",
+            )
+
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Approve", key=f"approve_{row['id']}", disabled=not (approver and acknowledged)):
+                try:
+                    with _connection() as conn:
+                        result = actions.approve_action(
+                            conn, read_client, write_client, row["id"], approver,
+                            ttl_hours=config.pending_action_ttl_hours, dsn=config.neon_dsn,
+                        )
+                except Exception as exc:
+                    result = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+                st.session_state.pop(preview_key, None)
+                st.session_state["last_action_result"] = result
+                st.rerun()
+        with col2:
+            if st.button("Reject", key=f"reject_{row['id']}", disabled=not approver):
+                try:
+                    with _connection() as conn:
+                        result = actions.reject_action(conn, row["id"], approver)
+                except Exception as exc:
+                    result = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+                st.session_state.pop(preview_key, None)
+                st.session_state["last_action_result"] = result
+                st.rerun()
+
+
 if not pending:
     st.info("No pending actions.")
 else:
     for row in pending:
-        preview_key = f"preview_{row['id']}"
-        header = f"{row['tool_name']} on {row['repo']}#{row['issue_number']}"
-        if row["heuristic_flagged"]:
-            header += "  [heuristic flag: advisory only, not a security boundary]"
-
-        with st.expander(header, expanded=preview_key in st.session_state):
-            st.write("Arguments")
-            st.json(row["arguments"])
-
-            if row.get("rationale"):
-                st.write("Why the proposer suggested this")
-                st.text(row["rationale"])
-
-            excerpt = row.get("source_excerpt")
-            if excerpt:
-                if excerpt.get("flag_matches"):
-                    st.warning(
-                        "The issue text contains phrases that look like prompt injection: "
-                        + ", ".join(excerpt["flag_matches"])
-                    )
-                if excerpt.get("flag_matches_not_shown"):
-                    st.error(
-                        "These phrases appear in issue text that is NOT stored or shown here: "
-                        + ", ".join(excerpt["flag_matches_not_shown"])
-                        + ". Load the current issue and read it before acting."
-                    )
-                if excerpt.get("text_truncated"):
-                    st.caption(
-                        "Part of the title, body, or a comment was cut to fit storage. Load the current issue "
-                        "to read the rest."
-                    )
-                if not str(row["requested_by"]).startswith("agent:"):
-                    st.caption(
-                        "This came from an MCP client, which may have read more of the issue than is stored here."
-                    )
-                st.write("Issue text stored with this proposal")
-                st.text(excerpt.get("title") or "(no title)")
-                st.text(excerpt.get("body") or "(no body)")
-                if excerpt.get("comments_omitted"):
-                    st.caption(f"{excerpt['comments_omitted']} earlier comment(s) not shown")
-                if excerpt.get("comments_truncated_by_fetcher"):
-                    st.caption("The comment list was cut off at the fetch limit")
-                for comment in excerpt.get("comments", []):
-                    st.text(f"comment by {comment['author']}: {comment['body']}")
-            else:
-                st.caption("No issue text was stored with this proposal. Use the live view below.")
-
-            st.write("Snapshot at proposal time")
-            st.json(row["issue_state_snapshot"])
-
-            st.caption(f"Proposed by {row['requested_by']} at {row['created_at']}")
-
-            if st.button("Load current issue from GitHub", key=f"load_{row['id']}"):
-                try:
-                    st.session_state[preview_key] = tools.get_issue(
-                        config.neon_dsn, read_client, row["repo"], row["issue_number"],
-                        "dashboard:preview", include_comments=True,
-                    )
-                except Exception as exc:
-                    st.session_state[preview_key] = {"error": str(exc)}
-
-            preview = st.session_state.get(preview_key)
-            live_flag_matches = []
-            if preview is not None:
-                if "error" in preview:
-                    st.warning(f"could not fetch source issue: {preview['error']}")
-                else:
-                    st.write("Current issue")
-                    st.text(preview.get("title", ""))
-                    st.text(preview.get("body") or "(no body)")
-                    for comment in (preview.get("comments_detail") or [])[-10:]:
-                        author = (comment.get("user") or {}).get("login") or "unknown"
-                        st.text(f"comment by {author}: {comment.get('body') or ''}")
-                    # heuristic_flagged is decided once, at proposal time, and stored on
-                    # the row. The issue can be edited afterward to add injection content,
-                    # and the button above fetches that live text, so re-run the same
-                    # check against it rather than trusting the stale, stored flag alone.
-                    live_flag_matches = flag_matches(tools.issue_plaintext(preview))
-                    if live_flag_matches:
-                        st.error(
-                            "The current issue text (fetched just now) contains phrases that look "
-                            "like prompt injection: " + ", ".join(live_flag_matches)
-                        )
-
-            acknowledged = True
-            if row["heuristic_flagged"] or live_flag_matches:
-                acknowledged = st.checkbox(
-                    "I read the flagged issue text and still want to act on this",
-                    key=f"ack_{row['id']}",
-                )
-
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("Approve", key=f"approve_{row['id']}", disabled=not (approver and acknowledged)):
-                    try:
-                        with _connection() as conn:
-                            result = actions.approve_action(
-                                conn, read_client, write_client, row["id"], approver,
-                                ttl_hours=config.pending_action_ttl_hours, dsn=config.neon_dsn,
-                            )
-                    except Exception as exc:
-                        result = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
-                    st.session_state.pop(preview_key, None)
-                    st.session_state["last_action_result"] = result
-                    st.rerun()
-            with col2:
-                if st.button("Reject", key=f"reject_{row['id']}", disabled=not approver):
-                    try:
-                        with _connection() as conn:
-                            result = actions.reject_action(conn, row["id"], approver)
-                    except Exception as exc:
-                        result = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
-                    st.session_state.pop(preview_key, None)
-                    st.session_state["last_action_result"] = result
-                    st.rerun()
+        _render_pending_row(row)
 
     if not approver:
         st.warning("Enter your name in the sidebar to enable approve/reject.")
