@@ -12,7 +12,7 @@ MAX_TITLE_CHARS = limits.TITLE_CHARS
 MAX_BODY_CHARS = limits.BODY_CHARS
 MAX_COMMENT_CHARS = limits.COMMENT_CHARS
 MAX_COMMENTS = limits.MAX_COMMENTS
-MAX_COMMENTS_TOTAL_CHARS = 6000
+MAX_COMMENTS_TOTAL_CHARS = limits.COMMENTS_TOTAL_CHARS
 
 SYSTEM_PROMPT = """You are a triage classifier for GitHub issues. You read one issue and decide which \
 triage actions, if any, to propose. You never execute actions, you only classify.
@@ -113,3 +113,5 @@ def build_user_prompt(issue: dict, repo_labels: list[str] | None = None, assigna
         f"{build_context_block(issue, repo_labels, assignable)}\n\n"
         f"{build_untrusted_block(issue)}"
     )
+
+

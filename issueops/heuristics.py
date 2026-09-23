@@ -33,3 +33,5 @@ def flag_matches(text: str) -> list[str]:
 
 def is_heuristically_flagged(text: str) -> bool:
     return bool(flag_matches(text))
+
+

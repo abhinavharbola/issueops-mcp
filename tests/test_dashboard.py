@@ -212,3 +212,5 @@ def test_wrong_or_empty_tokens_do_not_match(entered):
 def test_nothing_matches_when_no_token_is_configured():
     assert auth.token_matches("anything", None) is False
     assert auth.token_matches("", "") is False
+
+

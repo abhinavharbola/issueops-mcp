@@ -205,3 +205,5 @@ def test_present_search_summarizes_items_and_keeps_the_filter_note():
 
 def test_present_search_omits_the_filter_note_when_nothing_was_filtered():
     assert "filtered_out_other_repos" not in projection.present_search({"total_count": 0, "items": []})
+
+

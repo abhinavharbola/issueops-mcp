@@ -42,7 +42,7 @@ flowchart TD
     ghw -.-> audit
 ```
 
-Design notes for each step (lease-based claiming, the stale check, crash recovery, transaction discipline) are in [`docs/architecture.md`](docs/architecture.md).
+Design notes for each step (lease-based claiming, the stale check, crash recovery, transaction discipline) are covered in the [Guardrails](#guardrails) section below.
 
 ## Processes and credentials
 
@@ -54,7 +54,7 @@ Each process is started separately and loads only the credentials it needs, from
 | Triage agent | `python -m agent.triage` | read token, Groq key | No |
 | Dashboard | `streamlit run dashboard/app.py` | read token, write token | Yes, only after a human approves |
 
-`load_config(require_write_pat=False)` never reads the write token from the env file, drops it if it was inherited from the environment, and makes a later write-mode load in the same process raise. The Groq key is only required by the triage agent and the eval, so the dashboard does not hold an LLM key. So even with one shared `.env`, the MCP server and triage agent processes never hold `GITHUB_WRITE_PAT` in memory, only the dashboard does. Details and limits of this approach are in [`docs/architecture.md`](docs/architecture.md#credential-separation).
+`load_config(require_write_pat=False)` never reads the write token from the env file, drops it if it was inherited from the environment, and makes a later write-mode load in the same process raise. The Groq key is only required by the triage agent and the eval, so the dashboard does not hold an LLM key. So even with one shared `.env`, the MCP server and triage agent processes never hold `GITHUB_WRITE_PAT` in memory, only the dashboard does.
 
 ## MCP tools
 
@@ -83,7 +83,7 @@ Each process is started separately and loads only the credentials it needs, from
 - **Rationale:** the model's rationale is stored with each proposal and shown to the approver.
 - **Flags:** `--state`, `--max-issues`, `--since`, `--max-pages`, `--model`.
 - **Listing:** issues are read page by page and listing stops as soon as `--max-issues` candidates are found. If `--max-pages` is reached first, the run continues with the candidates it has and prints a warning to stderr instead of aborting.
-- **Prompt size:** the classifier sees at most 300 characters of title, 8000 of body, and the 10 most recent comments (1500 characters each, 6000 in total), with truncation noted inline, so a huge issue cannot exceed the model's request limits.
+- **Prompt size:** the classifier sees at most 300 characters of title, 8000 of body, and the 10 most recent comments (up to 1500 characters each, with the combined comment text additionally capped at 6000 characters), with truncation noted inline, so a huge issue cannot exceed the model's request limits.
 - **Names:** repo names are lower-cased everywhere. Label and assignee names are matched case-insensitively and stored with the spelling GitHub uses.
 
 ## Guardrails
@@ -149,7 +149,6 @@ issueops-mcp/
 │   └── custom_client.py         # call one MCP tool from the command line
 │
 ├── tests/                      # unit tests plus Postgres integration tests
-├── docs/architecture.md
 ├── conftest.py                 # fake DB used by the unit tests
 ├── .github/workflows/ci.yml
 ├── .env.example
@@ -231,9 +230,9 @@ In the dashboard, enter the access token and your name in the sidebar, expand a 
 
 ## Testing
 
-Install the dev dependencies once (`pytest` is not required at runtime, so it is not in `requirements.txt`), then run `pytest` from the repo root:
+Install the dependencies once (`pytest` is included in `requirements.txt`), then run `pytest` from the repo root:
 ```
-pip install -r requirements-dev.txt
+pip install -r requirements.txt
 pytest
 ```
 
@@ -266,3 +265,5 @@ No labeled dataset is shipped, only the template.
 - All processes share one Postgres role, so the audit log is append-only by convention (the code never issues an UPDATE, TRUNCATE, or DELETE against it outside `prune_audit_log.py`) rather than by database-enforced permission. Nothing in this repo stops a process holding the connection string from writing to `audit_log` directly.
 - The MCP read tools return projected summaries, not raw GitHub JSON. Fields that are not projected (reactions, timeline URLs, full user objects, review data on pull requests) are not available to the client, and `get_issue` returns only the 30 newest comments, each clipped to 2500 characters.
 - No dependency lockfile or license file is included. Choosing a license is up to the repository owner.
+
+

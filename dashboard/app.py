@@ -281,3 +281,5 @@ st.subheader("Recent audit log")
 with sync_connection(config.neon_dsn) as conn:
     audit_rows = actions.list_recent_audit_log(conn)
 st.dataframe(audit_rows, use_container_width=True)
+
+

@@ -15,3 +15,5 @@ UPDATE audit_log SET timestamp = now() WHERE timestamp IS NULL;
 ALTER TABLE audit_log ALTER COLUMN timestamp SET NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_pending_actions_requested_by ON pending_actions (requested_by, status);
+
+

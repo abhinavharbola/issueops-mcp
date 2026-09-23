@@ -724,3 +724,5 @@ def test_a_rate_limit_stops_the_run_instead_of_burning_the_remaining_issues(monk
     assert classify.call_count == 1
     patched.assert_not_called()
     assert "rate limiting" in capsys.readouterr().err
+
+

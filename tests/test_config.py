@@ -271,3 +271,5 @@ def test_repr_never_contains_a_secret(monkeypatch):
     rendered = repr(loaded) + str(loaded)
     for value in secrets.values():
         assert value not in rendered
+
+

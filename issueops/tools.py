@@ -791,3 +791,5 @@ def propose_close(dsn, read_client, repo, issue_number, reason, initiator, heuri
         rationale=rationale,
     )
     return {"id": action_id, "preview": f"Close {repo}#{issue_number}: {preview}"}
+
+

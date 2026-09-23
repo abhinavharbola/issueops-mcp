@@ -166,3 +166,5 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 INSERT INTO schema_migrations (version)
 VALUES ('001_hardening.sql'), ('002_needs_review.sql')
 ON CONFLICT (version) DO NOTHING;
+
+
