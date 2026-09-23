@@ -1,9 +1,9 @@
-import base64
 import math
 import os
 import sys
 from contextlib import contextmanager
 from pathlib import Path
+import base64
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -30,18 +30,11 @@ st.set_page_config(
 
 
 def _font_data_uri(filename: str) -> str:
-    # Self-hosted, embedded as a data: URI. Google Fonts' CDN is unreachable
-    # from this deployment, so an @import silently fails and every heading
-    # falls back to plain system Georgia. Shipping the actual woff2 bytes
-    # with the page removes the network dependency entirely.
     data = (FONT_DIR / filename).read_bytes()
     return "data:font/woff2;base64," + base64.b64encode(data).decode("ascii")
 
 
 def _inject_theme():
-    # Presentation only. No functional logic lives here. Keeping this call
-    # separate and near the top makes it obvious it can be deleted without
-    # touching behavior.
     font_600 = _font_data_uri("fraunces-600.woff2")
     font_700 = _font_data_uri("fraunces-700.woff2")
     font_face_css = f"""
@@ -245,11 +238,6 @@ write_client = GitHubWriteClient(config.github_write_pat)
 
 @st.cache_resource
 def _get_pool(dsn: str) -> ConnectionPool:
-    # st.cache_resource keeps this pool alive across reruns and across every
-    # session served by this process, instead of a fresh psycopg.connect(...)
-    # (a full TCP+TLS+auth handshake to Neon) on every button click, checkbox
-    # toggle, or expander open. min_size keeps a connection warm at all times;
-    # max_size bounds how many concurrent checkouts this dashboard can hold.
     return ConnectionPool(
         dsn,
         min_size=1,
@@ -357,12 +345,6 @@ metric_cols[1].metric("Needs review", total_needs_review)
 metric_cols[2].metric("Per page", PAGE_SIZE)
 
 page_count = max(1, math.ceil(total_pending / PAGE_SIZE))
-# A stable, explicit key keeps the selected page across reruns. Without one, Streamlit
-# derives the widget's identity partly from max_value, which changes every time an
-# action is approved or rejected, so the selection would silently reset to page 1 on
-# the very next rerun. Clamp any stored value before instantiating the widget, since
-# max_value can shrink below a previously chosen page once actions are resolved, and
-# Streamlit raises rather than clamping automatically.
 if st.session_state.get("dashboard_page", 1) > page_count:
     st.session_state["dashboard_page"] = page_count
 st.sidebar.subheader("Queue")
@@ -401,13 +383,6 @@ def _describe_proposal(tool_name, arguments):
 
 @st.fragment
 def _render_pending_row(row):
-    # Scoped to just this row. Expanding it, clicking "Load current issue", and
-    # ticking the acknowledgement checkbox only rerun this fragment, not the whole
-    # page, so they no longer re-run the DB queries above or re-render every other
-    # row. Approve and Reject still call plain st.rerun(), whose default scope is
-    # "app" even from inside a fragment, so those two correctly force a full page
-    # rerun -- they change the pending list, the counts, and the audit log below,
-    # all of which live outside this fragment.
     preview_key = f"preview_{row['id']}"
     summary = _describe_proposal(row["tool_name"], row["arguments"])
     header = f"{summary} on {row['repo']}#{row['issue_number']}"
@@ -461,8 +436,7 @@ def _render_pending_row(row):
                 if excerpt.get("comments_truncated_by_fetcher"):
                     st.caption("The comment list was cut off at the fetch limit")
                 for comment in excerpt.get("comments", []):
-                    st.caption(f"Comment by {comment['author']}")
-                    st.text(comment["body"])
+                    st.text(f"comment by {comment['author']}: {comment['body']}")
         else:
             st.caption("No issue text was stored with this proposal. Use the live view below.")
 
@@ -618,9 +592,5 @@ st.divider()
 st.subheader("Recent audit log")
 with _connection() as conn:
     audit_rows = actions.list_recent_audit_log(conn)
-# The id column can come back as a uuid.UUID or bytes object depending on the
-# column type and driver, and st.dataframe's Arrow conversion renders those
-# as a raw {"0": 209, "1": 254, ...} byte map instead of readable text.
-# Stringifying here is presentation-only; the underlying rows are untouched.
 audit_rows = [{**row, "id": str(row["id"])} for row in audit_rows]
 st.dataframe(audit_rows, width="stretch")
