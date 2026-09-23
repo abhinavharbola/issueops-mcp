@@ -380,6 +380,25 @@ st.divider()
 st.subheader("Pending actions")
 
 
+def _describe_proposal(tool_name, arguments):
+    if tool_name == "propose_add_labels":
+        labels = arguments.get("labels") or []
+        plural = "s" if len(labels) != 1 else ""
+        return f"Add label{plural} " + ", ".join(f"'{label}'" for label in labels)
+    if tool_name == "propose_remove_labels":
+        labels = arguments.get("labels") or []
+        plural = "s" if len(labels) != 1 else ""
+        return f"Remove label{plural} " + ", ".join(f"'{label}'" for label in labels)
+    if tool_name == "propose_assign":
+        return f"Assign to '{arguments.get('assignee')}'"
+    if tool_name == "propose_close":
+        reason = arguments.get("reason")
+        return f"Close as '{reason}'" if reason else "Close"
+    if tool_name == "propose_add_comment":
+        return "Add a comment"
+    return tool_name
+
+
 @st.fragment
 def _render_pending_row(row):
     # Scoped to just this row. Expanding it, clicking "Load current issue", and
@@ -390,13 +409,18 @@ def _render_pending_row(row):
     # rerun -- they change the pending list, the counts, and the audit log below,
     # all of which live outside this fragment.
     preview_key = f"preview_{row['id']}"
-    header = f"{row['tool_name']} on {row['repo']}#{row['issue_number']}"
+    summary = _describe_proposal(row["tool_name"], row["arguments"])
+    header = f"{summary} on {row['repo']}#{row['issue_number']}"
     if row["heuristic_flagged"]:
         header += "  [heuristic flag: advisory only, not a security boundary]"
 
     with st.expander(header, expanded=preview_key in st.session_state):
-        st.write("Arguments")
-        st.json(row["arguments"])
+        st.markdown(f"### Action: {summary}")
+        if row["tool_name"] == "propose_add_comment":
+            st.write("Comment text (proposed)")
+            st.text((row["arguments"].get("body") or "").strip() or "(empty)")
+        with st.expander("Raw arguments", expanded=False):
+            st.json(row["arguments"])
 
         if row.get("rationale"):
             st.write("Why the proposer suggested this")
@@ -427,19 +451,29 @@ def _render_pending_row(row):
                     "This came from an MCP client, which may have read more of the issue than is stored here."
                 )
             st.write("Issue text stored with this proposal")
-            st.text(excerpt.get("title") or "(no title)")
-            st.text(excerpt.get("body") or "(no body)")
-            if excerpt.get("comments_omitted"):
-                st.caption(f"{excerpt['comments_omitted']} earlier comment(s) not shown")
-            if excerpt.get("comments_truncated_by_fetcher"):
-                st.caption("The comment list was cut off at the fetch limit")
-            for comment in excerpt.get("comments", []):
-                st.text(f"comment by {comment['author']}: {comment['body']}")
+            with st.container(border=True):
+                st.caption("Title")
+                st.text(excerpt.get("title") or "(no title)")
+                st.caption("Body")
+                st.text(excerpt.get("body") or "(no body)")
+                if excerpt.get("comments_omitted"):
+                    st.caption(f"{excerpt['comments_omitted']} earlier comment(s) not shown")
+                if excerpt.get("comments_truncated_by_fetcher"):
+                    st.caption("The comment list was cut off at the fetch limit")
+                for comment in excerpt.get("comments", []):
+                    st.caption(f"Comment by {comment['author']}")
+                    st.text(comment["body"])
         else:
             st.caption("No issue text was stored with this proposal. Use the live view below.")
 
-        st.write("Snapshot at proposal time")
-        st.json(row["issue_state_snapshot"])
+        snapshot = row["issue_state_snapshot"] or {}
+        snap_labels = ", ".join(snapshot.get("labels") or []) or "none"
+        snap_assignees = ", ".join(snapshot.get("assignees") or []) or "none"
+        st.caption(
+            f"At proposal time: state={snapshot.get('state')}, labels={snap_labels}, assignees={snap_assignees}"
+        )
+        with st.expander("Raw snapshot", expanded=False):
+            st.json(row["issue_state_snapshot"])
 
         st.caption(f"Proposed by {row['requested_by']} at {row['created_at']}")
 
@@ -459,11 +493,15 @@ def _render_pending_row(row):
                 st.warning(f"could not fetch source issue: {preview['error']}", icon=":material/warning:")
             else:
                 st.write("Current issue")
-                st.text(preview.get("title", ""))
-                st.text(preview.get("body") or "(no body)")
-                for comment in (preview.get("comments_detail") or [])[-10:]:
-                    author = (comment.get("user") or {}).get("login") or "unknown"
-                    st.text(f"comment by {author}: {comment.get('body') or ''}")
+                with st.container(border=True):
+                    st.caption("Title")
+                    st.text(preview.get("title", ""))
+                    st.caption("Body")
+                    st.text(preview.get("body") or "(no body)")
+                    for comment in (preview.get("comments_detail") or [])[-10:]:
+                        author = (comment.get("user") or {}).get("login") or "unknown"
+                        st.caption(f"Comment by {author}")
+                        st.text(comment.get("body") or "")
                 # heuristic_flagged is decided once, at proposal time, and stored on
                 # the row. The issue can be edited afterward to add injection content,
                 # and the button above fetches that live text, so re-run the same
