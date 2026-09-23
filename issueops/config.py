@@ -3,6 +3,8 @@ from dataclasses import dataclass, field
 
 from dotenv import dotenv_values, find_dotenv
 
+from issueops import limits
+
 WRITE_PAT_NAME = "GITHUB_WRITE_PAT"
 
 
@@ -15,7 +17,9 @@ class Config:
     logfire_token: str | None = field(repr=False)
     pending_action_ttl_hours: int = 48
     stuck_approving_recovery_minutes: int = 10
-    comment_body_max_chars: int = 65536
+    comment_body_max_chars: int = limits.COMMENT_BODY_MAX_CHARS_DEFAULT
+    max_pending_per_issue: int = limits.MAX_PENDING_PER_ISSUE_DEFAULT
+    max_pending_per_initiator: int = limits.MAX_PENDING_PER_INITIATOR_DEFAULT
     mcp_client_label: str | None = None
     dashboard_access_token: str | None = field(default=None, repr=False)
     dashboard_allow_insecure: bool = False
@@ -86,10 +90,12 @@ def load_config(require_write_pat: bool = False, require_groq: bool = False) -> 
         logfire_token=os.environ.get("LOGFIRE_TOKEN") or None,
         pending_action_ttl_hours=optional_int("PENDING_ACTION_TTL_HOURS", 48),
         stuck_approving_recovery_minutes=optional_int("STUCK_APPROVING_RECOVERY_MINUTES", 10),
-        comment_body_max_chars=optional_int("COMMENT_BODY_MAX_CHARS", 65536),
+        comment_body_max_chars=optional_int("COMMENT_BODY_MAX_CHARS", limits.COMMENT_BODY_MAX_CHARS_DEFAULT),
+        max_pending_per_issue=optional_int("MAX_PENDING_PER_ISSUE", limits.MAX_PENDING_PER_ISSUE_DEFAULT),
+        max_pending_per_initiator=optional_int(
+            "MAX_PENDING_PER_INITIATOR", limits.MAX_PENDING_PER_INITIATOR_DEFAULT
+        ),
         mcp_client_label=os.environ.get("MCP_CLIENT_LABEL") or None,
         dashboard_access_token=os.environ.get("DASHBOARD_ACCESS_TOKEN") or None,
         dashboard_allow_insecure=os.environ.get("DASHBOARD_ALLOW_INSECURE", "").strip().lower() in ("1", "true", "yes"),
     )
-
-

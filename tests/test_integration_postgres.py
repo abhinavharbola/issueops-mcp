@@ -893,5 +893,3 @@ def test_the_allowlist_rejects_path_traversal_names_in_the_script_and_in_the_dat
     with tools.sync_connection(dsn) as conn:
         names = [r["repo"] for r in conn.execute("SELECT repo FROM repo_allowlist ORDER BY repo").fetchall()]
     assert "some-org/some.repo_1" in names
-
-

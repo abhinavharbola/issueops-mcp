@@ -165,5 +165,3 @@ def test_marker_stripping_still_applies_before_truncation():
     block = build_untrusted_block(issue)
 
     assert block.count(UNTRUSTED_END) == 1
-
-

@@ -127,34 +127,50 @@ def propose_add_comment(repo: str, issue_number: int, body: str):
     return tools.propose_add_comment(
         config.neon_dsn, read_client, repo, issue_number, body, initiator,
         max_body_chars=config.comment_body_max_chars,
+        max_pending_per_issue=config.max_pending_per_issue,
+        max_pending_per_initiator=config.max_pending_per_initiator,
     )
 
 
 @server.tool(description="Queue label additions on an issue for human approval. Does not modify GitHub.")
 @_translate_errors
 def propose_add_labels(repo: str, issue_number: int, labels: list[str]):
-    return tools.propose_add_labels(config.neon_dsn, read_client, repo, issue_number, labels, initiator)
+    return tools.propose_add_labels(
+        config.neon_dsn, read_client, repo, issue_number, labels, initiator,
+        max_pending_per_issue=config.max_pending_per_issue,
+        max_pending_per_initiator=config.max_pending_per_initiator,
+    )
 
 
 @server.tool(description="Queue label removals on an issue for human approval. Does not modify GitHub.")
 @_translate_errors
 def propose_remove_labels(repo: str, issue_number: int, labels: list[str]):
-    return tools.propose_remove_labels(config.neon_dsn, read_client, repo, issue_number, labels, initiator)
+    return tools.propose_remove_labels(
+        config.neon_dsn, read_client, repo, issue_number, labels, initiator,
+        max_pending_per_issue=config.max_pending_per_issue,
+        max_pending_per_initiator=config.max_pending_per_initiator,
+    )
 
 
 @server.tool(description="Queue an assignee for an issue for human approval. Does not modify GitHub.")
 @_translate_errors
 def propose_assign(repo: str, issue_number: int, assignee: str):
-    return tools.propose_assign(config.neon_dsn, read_client, repo, issue_number, assignee, initiator)
+    return tools.propose_assign(
+        config.neon_dsn, read_client, repo, issue_number, assignee, initiator,
+        max_pending_per_issue=config.max_pending_per_issue,
+        max_pending_per_initiator=config.max_pending_per_initiator,
+    )
 
 
 @server.tool(description="Queue closing an issue for human approval. Does not modify GitHub.")
 @_translate_errors
 def propose_close(repo: str, issue_number: int, reason: str | None = None):
-    return tools.propose_close(config.neon_dsn, read_client, repo, issue_number, reason, initiator)
+    return tools.propose_close(
+        config.neon_dsn, read_client, repo, issue_number, reason, initiator,
+        max_pending_per_issue=config.max_pending_per_issue,
+        max_pending_per_initiator=config.max_pending_per_initiator,
+    )
 
 
 if __name__ == "__main__":
     server.run()
-
-

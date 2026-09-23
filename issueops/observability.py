@@ -36,5 +36,3 @@ def configure_logfire(token: str | None, service_name: str) -> None:
         logfire.instrument_psycopg()
     except Exception as exc:
         print(f"[{service_name}] logfire psycopg instrumentation unavailable, continuing: {exc}", file=sys.stderr)
-
-

@@ -855,5 +855,3 @@ def test_the_rationale_is_stored_clipped(monkeypatch):
 
     params = _insert_params(fake_conn)
     assert params[8].endswith("[truncated 100 chars]")
-
-

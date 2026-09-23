@@ -17,9 +17,9 @@ VALID_CLOSE_REASONS = {"completed", "not_planned", None}
 
 DEFAULT_LIST_LIMIT = 50
 MAX_LIST_LIMIT = 100
-DEFAULT_COMMENT_BODY_MAX_CHARS = 65536
-DEFAULT_MAX_PENDING_PER_ISSUE = 10
-DEFAULT_MAX_PENDING_PER_INITIATOR = 500
+DEFAULT_COMMENT_BODY_MAX_CHARS = limits.COMMENT_BODY_MAX_CHARS_DEFAULT
+DEFAULT_MAX_PENDING_PER_ISSUE = limits.MAX_PENDING_PER_ISSUE_DEFAULT
+DEFAULT_MAX_PENDING_PER_INITIATOR = limits.MAX_PENDING_PER_INITIATOR_DEFAULT
 MAX_ACTIVITY_WINDOW_DAYS = 365
 
 _SEARCH_SCOPE_QUALIFIER = re.compile(r"(?:^|[\s(])-?(?:repo|org|user|owner)\s*:", re.IGNORECASE)
@@ -439,7 +439,7 @@ def _find_existing_pending(conn, repo, issue_number, tool_name, arguments: dict)
     rows = conn.execute(
         """
         SELECT id, arguments FROM pending_actions
-        WHERE repo = %s AND issue_number = %s AND tool_name = %s AND status = 'pending'
+        WHERE repo = %s AND issue_number = %s AND tool_name = %s AND status IN ('pending', 'approving')
         """,
         (repo, issue_number, tool_name),
     ).fetchall()
@@ -517,9 +517,20 @@ def snapshot_issue_state(read_client: GitHubReadClient, repo: str, issue_number:
     return _snapshot_from_issue(issue)
 
 
-def _enforce_pending_caps(conn, repo: str, issue_number: int, initiator: str):
-    per_issue_limit = _pending_limit("MAX_PENDING_PER_ISSUE", DEFAULT_MAX_PENDING_PER_ISSUE)
-    per_initiator_limit = _pending_limit("MAX_PENDING_PER_INITIATOR", DEFAULT_MAX_PENDING_PER_INITIATOR)
+def _enforce_pending_caps(
+    conn, repo: str, issue_number: int, initiator: str,
+    max_pending_per_issue: int | None = None, max_pending_per_initiator: int | None = None,
+):
+    per_issue_limit = (
+        max_pending_per_issue
+        if max_pending_per_issue is not None
+        else _pending_limit("MAX_PENDING_PER_ISSUE", DEFAULT_MAX_PENDING_PER_ISSUE)
+    )
+    per_initiator_limit = (
+        max_pending_per_initiator
+        if max_pending_per_initiator is not None
+        else _pending_limit("MAX_PENDING_PER_INITIATOR", DEFAULT_MAX_PENDING_PER_INITIATOR)
+    )
 
     issue_row = conn.execute(
         """
@@ -572,6 +583,8 @@ def _queue_proposal(
     prefetched_issue: dict | None = None,
     state_check=None,
     rationale: str | None = None,
+    max_pending_per_issue: int | None = None,
+    max_pending_per_initiator: int | None = None,
 ) -> tuple[str, str, bool]:
     start = _now_ts()
     with sync_connection(dsn) as conn:
@@ -587,7 +600,10 @@ def _queue_proposal(
             if existing_id:
                 return _record_dedup(conn, tool_name, repo, issue_number, arguments, existing_id, initiator, start)
 
-            _enforce_pending_caps(conn, repo, issue_number, initiator)
+            _enforce_pending_caps(
+                conn, repo, issue_number, initiator,
+                max_pending_per_issue=max_pending_per_issue, max_pending_per_initiator=max_pending_per_initiator,
+            )
 
             snapshot_issue = prefetched_issue if prefetched_issue is not None else read_client.get_issue(repo, issue_number)
             if state_check is not None:
@@ -611,7 +627,10 @@ def _queue_proposal(
                 if existing_id:
                     return _record_dedup(conn, tool_name, repo, issue_number, arguments, existing_id, initiator, start)
 
-                _enforce_pending_caps(conn, repo, issue_number, initiator)
+                _enforce_pending_caps(
+                    conn, repo, issue_number, initiator,
+                    max_pending_per_issue=max_pending_per_issue, max_pending_per_initiator=max_pending_per_initiator,
+                )
 
                 row = conn.execute(
                     """
@@ -651,6 +670,7 @@ def propose_add_comment(
     dsn, read_client, repo, issue_number, body, initiator, heuristic_flagged=False,
     max_body_chars: int = DEFAULT_COMMENT_BODY_MAX_CHARS, issue: dict | None = None,
     rationale: str | None = None,
+    max_pending_per_issue: int | None = None, max_pending_per_initiator: int | None = None,
 ):
     repo = normalize_repo(repo)
     body = body.strip()
@@ -665,6 +685,7 @@ def propose_add_comment(
     action_id, preview, _ = _queue_proposal(
         dsn, read_client, "propose_add_comment", repo, issue_number, arguments, initiator, heuristic_flagged,
         validate_fn=validate, prefetched_issue=issue, rationale=rationale,
+        max_pending_per_issue=max_pending_per_issue, max_pending_per_initiator=max_pending_per_initiator,
     )
     return {"id": action_id, "preview": f"Add comment on {repo}#{issue_number}: {preview}"}
 
@@ -720,6 +741,7 @@ def _check_close_state(issue: dict, arguments: dict):
 def _propose_labels(
     tool_name, verb, state_check, dsn, read_client, repo, issue_number, labels, initiator,
     heuristic_flagged, issue, rationale=None,
+    max_pending_per_issue=None, max_pending_per_initiator=None,
 ):
     repo = normalize_repo(repo)
     resolved = {}
@@ -732,26 +754,38 @@ def _propose_labels(
         dsn, read_client, tool_name, repo, issue_number, {"labels": sorted(labels or [])}, initiator,
         heuristic_flagged, validate_fn=validate, prefetched_issue=issue, state_check=state_check,
         rationale=rationale,
+        max_pending_per_issue=max_pending_per_issue, max_pending_per_initiator=max_pending_per_initiator,
     )
     shown = resolved.get("labels", labels)
     return {"id": action_id, "preview": f"{verb} labels {shown} on {repo}#{issue_number}: {preview}"}
 
 
-def propose_add_labels(dsn, read_client, repo, issue_number, labels, initiator, heuristic_flagged=False, issue: dict | None = None, rationale: str | None = None):
+def propose_add_labels(
+    dsn, read_client, repo, issue_number, labels, initiator, heuristic_flagged=False, issue: dict | None = None,
+    rationale: str | None = None, max_pending_per_issue: int | None = None, max_pending_per_initiator: int | None = None,
+):
     return _propose_labels(
         "propose_add_labels", "Add", _check_add_labels_state, dsn, read_client, repo, issue_number,
         labels, initiator, heuristic_flagged, issue, rationale,
+        max_pending_per_issue=max_pending_per_issue, max_pending_per_initiator=max_pending_per_initiator,
     )
 
 
-def propose_remove_labels(dsn, read_client, repo, issue_number, labels, initiator, heuristic_flagged=False, issue: dict | None = None, rationale: str | None = None):
+def propose_remove_labels(
+    dsn, read_client, repo, issue_number, labels, initiator, heuristic_flagged=False, issue: dict | None = None,
+    rationale: str | None = None, max_pending_per_issue: int | None = None, max_pending_per_initiator: int | None = None,
+):
     return _propose_labels(
         "propose_remove_labels", "Remove", _check_remove_labels_state, dsn, read_client, repo,
         issue_number, labels, initiator, heuristic_flagged, issue, rationale,
+        max_pending_per_issue=max_pending_per_issue, max_pending_per_initiator=max_pending_per_initiator,
     )
 
 
-def propose_assign(dsn, read_client, repo, issue_number, assignee, initiator, heuristic_flagged=False, issue: dict | None = None, rationale: str | None = None):
+def propose_assign(
+    dsn, read_client, repo, issue_number, assignee, initiator, heuristic_flagged=False, issue: dict | None = None,
+    rationale: str | None = None, max_pending_per_issue: int | None = None, max_pending_per_initiator: int | None = None,
+):
     repo = normalize_repo(repo)
     resolved = {}
 
@@ -773,11 +807,15 @@ def propose_assign(dsn, read_client, repo, issue_number, assignee, initiator, he
         dsn, read_client, "propose_assign", repo, issue_number, {"assignee": assignee}, initiator,
         heuristic_flagged, validate_fn=validate, prefetched_issue=issue, state_check=_check_assign_state,
         rationale=rationale,
+        max_pending_per_issue=max_pending_per_issue, max_pending_per_initiator=max_pending_per_initiator,
     )
     return {"id": action_id, "preview": f"Assign {resolved.get('assignee', assignee)} on {repo}#{issue_number}: {preview}"}
 
 
-def propose_close(dsn, read_client, repo, issue_number, reason, initiator, heuristic_flagged=False, issue: dict | None = None, rationale: str | None = None):
+def propose_close(
+    dsn, read_client, repo, issue_number, reason, initiator, heuristic_flagged=False, issue: dict | None = None,
+    rationale: str | None = None, max_pending_per_issue: int | None = None, max_pending_per_initiator: int | None = None,
+):
     repo = normalize_repo(repo)
 
     def validate():
@@ -789,7 +827,6 @@ def propose_close(dsn, read_client, repo, issue_number, reason, initiator, heuri
         dsn, read_client, "propose_close", repo, issue_number, arguments, initiator, heuristic_flagged,
         validate_fn=validate, prefetched_issue=issue, state_check=_check_close_state,
         rationale=rationale,
+        max_pending_per_issue=max_pending_per_issue, max_pending_per_initiator=max_pending_per_initiator,
     )
     return {"id": action_id, "preview": f"Close {repo}#{issue_number}: {preview}"}
-
-

@@ -203,6 +203,7 @@ def patched(monkeypatch):
     monkeypatch.setattr(triage, "load_config", MagicMock(return_value=MagicMock(
         neon_dsn="dsn", github_read_pat="pat", logfire_token=None,
         groq_api_key="k", comment_body_max_chars=65536,
+        max_pending_per_issue=10, max_pending_per_initiator=500,
     )))
     monkeypatch.setattr(triage, "configure_logfire", MagicMock())
     monkeypatch.setattr(triage, "GitHubReadClient", MagicMock())
@@ -238,7 +239,7 @@ def test_run_triage_calls_propose_add_labels_with_the_prefetched_issue(monkeypat
     assert results[0]["proposals"][0]["result"]["id"] == "p1"
     fake_propose.assert_called_once_with(
         "dsn", triage.GitHubReadClient.return_value, "owner/repo", 1, {"labels": ["bug"]}, "test", False, issue,
-        rationale="r", max_body_chars=65536,
+        rationale="r", max_body_chars=65536, max_pending_per_issue=10, max_pending_per_initiator=500,
     )
 
 
@@ -724,5 +725,3 @@ def test_a_rate_limit_stops_the_run_instead_of_burning_the_remaining_issues(monk
     assert classify.call_count == 1
     patched.assert_not_called()
     assert "rate limiting" in capsys.readouterr().err
-
-

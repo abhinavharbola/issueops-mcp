@@ -41,5 +41,3 @@ def test_flag_matches_lists_every_matched_phrase():
 
     assert matches == ["ignore previous instructions", "system prompt"]
     assert flag_matches("a normal bug report") == []
-
-

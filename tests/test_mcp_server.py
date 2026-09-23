@@ -82,5 +82,3 @@ def test_initiator_uses_the_configured_client_label(monkeypatch):
     importlib.reload(module)
 
     assert module.initiator == "mcp:laptop-1"
-
-

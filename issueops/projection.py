@@ -111,5 +111,3 @@ def present_search(result: dict) -> dict:
     if "filtered_out_other_repos" in result:
         presented["filtered_out_other_repos"] = result["filtered_out_other_repos"]
     return presented
-
-

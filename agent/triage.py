@@ -51,18 +51,22 @@ class ClassificationError(Exception):
 
 
 PROPOSE_DISPATCH = {
-    "propose_add_labels": lambda dsn, rc, repo, num, args, initiator, flagged, issue, rationale=None, max_body_chars=None: tools.propose_add_labels(
-        dsn, rc, repo, num, args["labels"], initiator, heuristic_flagged=flagged, issue=issue, rationale=rationale
+    "propose_add_labels": lambda dsn, rc, repo, num, args, initiator, flagged, issue, rationale=None, max_body_chars=None, max_pending_per_issue=None, max_pending_per_initiator=None: tools.propose_add_labels(
+        dsn, rc, repo, num, args["labels"], initiator, heuristic_flagged=flagged, issue=issue, rationale=rationale,
+        max_pending_per_issue=max_pending_per_issue, max_pending_per_initiator=max_pending_per_initiator,
     ),
-    "propose_add_comment": lambda dsn, rc, repo, num, args, initiator, flagged, issue, rationale=None, max_body_chars=None: tools.propose_add_comment(
+    "propose_add_comment": lambda dsn, rc, repo, num, args, initiator, flagged, issue, rationale=None, max_body_chars=None, max_pending_per_issue=None, max_pending_per_initiator=None: tools.propose_add_comment(
         dsn, rc, repo, num, args["body"], initiator, heuristic_flagged=flagged, issue=issue, rationale=rationale,
+        max_pending_per_issue=max_pending_per_issue, max_pending_per_initiator=max_pending_per_initiator,
         **({"max_body_chars": max_body_chars} if max_body_chars else {}),
     ),
-    "propose_close": lambda dsn, rc, repo, num, args, initiator, flagged, issue, rationale=None, max_body_chars=None: tools.propose_close(
-        dsn, rc, repo, num, args.get("reason"), initiator, heuristic_flagged=flagged, issue=issue, rationale=rationale
+    "propose_close": lambda dsn, rc, repo, num, args, initiator, flagged, issue, rationale=None, max_body_chars=None, max_pending_per_issue=None, max_pending_per_initiator=None: tools.propose_close(
+        dsn, rc, repo, num, args.get("reason"), initiator, heuristic_flagged=flagged, issue=issue, rationale=rationale,
+        max_pending_per_issue=max_pending_per_issue, max_pending_per_initiator=max_pending_per_initiator,
     ),
-    "propose_assign": lambda dsn, rc, repo, num, args, initiator, flagged, issue, rationale=None, max_body_chars=None: tools.propose_assign(
-        dsn, rc, repo, num, args["assignee"], initiator, heuristic_flagged=flagged, issue=issue, rationale=rationale
+    "propose_assign": lambda dsn, rc, repo, num, args, initiator, flagged, issue, rationale=None, max_body_chars=None, max_pending_per_issue=None, max_pending_per_initiator=None: tools.propose_assign(
+        dsn, rc, repo, num, args["assignee"], initiator, heuristic_flagged=flagged, issue=issue, rationale=rationale,
+        max_pending_per_issue=max_pending_per_issue, max_pending_per_initiator=max_pending_per_initiator,
     ),
 }
 
@@ -328,6 +332,8 @@ def run_triage(
                         dsn, read_client, repo, issue_number, args, initiator, flagged, issue,
                         rationale=classification.get("rationale"),
                         max_body_chars=config.comment_body_max_chars,
+                        max_pending_per_issue=config.max_pending_per_issue,
+                        max_pending_per_initiator=config.max_pending_per_initiator,
                     )
                     proposals.append({"tool_name": tool_name, "result": proposal})
                 except tools.QueueFullError as exc:
@@ -404,8 +410,10 @@ def run_triage(
     return results
 
 
-def run_scheduled(repo: str, state: str = "open"):
-    return run_triage(repo, initiator="agent:scheduled", state=state)
+def run_scheduled(repo: str, state: str = "open", allow_comment: bool = False, allow_close: bool = False):
+    return run_triage(
+        repo, initiator="agent:scheduled", state=state, allow_comment=allow_comment, allow_close=allow_close,
+    )
 
 
 def main():
@@ -439,5 +447,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
