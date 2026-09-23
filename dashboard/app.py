@@ -304,6 +304,4 @@ st.divider()
 st.subheader("Recent audit log")
 with _connection() as conn:
     audit_rows = actions.list_recent_audit_log(conn)
-st.dataframe(audit_rows, use_container_width=True)
-
-
+st.dataframe(audit_rows, width="stretch")
