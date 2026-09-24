@@ -131,9 +131,16 @@ def _inject_theme():
         section[data-testid="stSidebar"] div[data-testid="stTextInput"] input,
         section[data-testid="stSidebar"] div[data-testid="stNumberInput"] input {
             background-color: #FFFFFF !important;
+            border: none !important;
+            border-radius: 0 !important;
+            color: var(--color-text) !important;
+        }
+
+        section[data-testid="stSidebar"] div[data-testid="stTextInput"] div[data-baseweb="input"],
+        section[data-testid="stSidebar"] div[data-testid="stNumberInput"] div[data-baseweb="input"] {
             border: 1px solid rgba(255, 255, 255, 0.3) !important;
             border-radius: 6px !important;
-            color: var(--color-text) !important;
+            overflow: hidden;
         }
 
         section[data-testid="stSidebar"] div[data-testid="stNumberInput"] button {
@@ -143,6 +150,26 @@ def _inject_theme():
 
         section[data-testid="stSidebar"] div[data-testid="stNumberInput"] button svg {
             fill: var(--color-rosewood-deep) !important;
+        }
+
+        section[data-testid="stSidebar"] div[data-testid="stTextInput"] div[data-baseweb="input"] {
+            background-color: #FFFFFF !important;
+        }
+
+        section[data-testid="stSidebar"] div[data-testid="stTextInput"] div[data-baseweb="base-input"] {
+            background-color: #FFFFFF !important;
+        }
+
+        section[data-testid="stSidebar"] div[data-testid="stTextInput"] button {
+            background-color: transparent !important;
+            color: var(--color-rosewood-deep) !important;
+            opacity: 1 !important;
+        }
+
+        section[data-testid="stSidebar"] div[data-testid="stTextInput"] button * {
+            color: var(--color-rosewood-deep) !important;
+            fill: var(--color-rosewood-deep) !important;
+            opacity: 1 !important;
         }
 
         section[data-testid="stSidebar"] hr { border-color: rgba(255, 255, 255, 0.22); }
