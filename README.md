@@ -2,7 +2,7 @@
 
 A human-in-the-loop GitHub issue triage system. An MCP client (Claude) or a scheduled triage agent can read issues and **propose** changes: comments, labels, assignees, closing. Nothing reaches GitHub until a person approves the proposal in a Streamlit dashboard, and every read, proposal, and decision is written to an audit log.
 
-Built on free-tier infrastructure: a Neon Postgres DB, Groq for the classifier, and GitHub PATs.
+Built on free-tier infrastructure: a Neon Postgres database, Groq for the classifier, and fine-grained GitHub tokens.
 
 ## Preview
 
@@ -247,9 +247,7 @@ Copy [`eval/labels_template.json`](eval/labels_template.json) as a starting poin
 
 - **Adversarial behavior** on issues with injected instructions. `adversarial_any_action_rate` counts any queued proposal; `proposal_level_susceptibility` also counts injection markers appearing in model output. Neither metric distinguishes "correctly identified spam and proposed to close it" from "obeyed the embedded instruction", both look like `acted: true`. `propose_*` tools are always scoped to the single issue being classified, so nothing here lets an injected instruction (e.g. "close all issues") act beyond that one row regardless of what the model decides, and every proposal still needs human approval before it reaches GitHub.
 
-* **Audit consistency**, checked both directions between `audit_log` and `pending_actions`. Catches bookkeeping bugs in this codebase, not writes made outside it. Pruned audit rows are excluded from the count; check GitHub's own audit log for out-of-band write-token activity.
-
-No labeled dataset is shipped, only the template.
+* **Audit consistency**, checked both directions between `audit_log` and `pending_actions`. Catches bookkeeping bugs in this codebase, not writes made outside it. Pruned audit rows are excluded from the count.
 
 ## Evaluation Metrics (Local Run)
 
