@@ -2,7 +2,7 @@
 
 A human-in-the-loop GitHub issue triage system. An MCP client (Claude) or a scheduled triage agent can read issues and **propose** changes: comments, labels, assignees, closing. Nothing reaches GitHub until a person approves the proposal in a Streamlit dashboard, and every read, proposal, and decision is written to an audit log.
 
-Built on free-tier infrastructure: a Neon Postgres database, Groq for the classifier, and fine-grained GitHub tokens.
+Built on free-tier infrastructure: a Neon Postgres database, Groq for the classifier, and separate fine-grained GitHub PAT for read and write actions.
 
 ## Preview
 
@@ -22,7 +22,7 @@ Given an allowlisted repository, the system:
 2. Validates each proposal (allowlist, arguments, queue limits, duplicates), snapshots the issue, and queues it in Postgres as a `pending_actions` row.
 3. Shows queued proposals in a dashboard, where a human reads the source issue and approves or rejects.
 4. On approval, claims the row with a lease, re-fetches the issue, checks it hasn't changed in a way that matters, and only then writes to GitHub using a separate write token.
-5. Records everything in `audit_log`, including proposals that were deduplicated, rejected as invalid, went stale, or failed.
+5. Records everything in `audit_log`: proposals that were deduplicated, rejected as invalid, went stale, or failed.
 
 A scheduled triage agent (`agent/triage.py`) uses the same propose path. It classifies open issues with an LLM and queues labels, comments, assignments, or closes for a human to review.
 
@@ -70,11 +70,11 @@ Each process is started separately and loads only the credentials it needs, from
 
 | Kind | Tool | What it does |
 |---|---|---|
-| Read | `list_issues` | List issue summaries by state, labels, and recency. At most `limit` items (default 50, maximum 100) with a `truncated` flag, body excerpts only, pull requests marked `is_pull_request` |
-| Read | `get_issue` | One issue with its 30 newest comments. Body and comments are clipped, and the result says how many comments were omitted |
+| Read | `list_issues` | List issue summaries by state, labels, and recency. At most `limit` items (default 50, max. 100) with a `truncated` flag, body excerpts only. |
+| Read | `get_issue` | One issue with its 30 newest comments. Body and the comments are clipped, and the result says how many comments were omitted |
 | Read | `list_pull_requests` | List pull request summaries. At most `limit` items (default 50, maximum 100) with a `truncated` flag |
 | Read | `search_issues` | Search within one repo. `repo:`, `org:`, `user:`, `owner:` qualifiers are rejected and results from other repos are dropped. Results are summaries with body excerpts |
-| Read | `get_repo_activity_summary` | Issues opened, issues closed, distinct issues with comments, and opened issues by label, over 1 to 365 days. On very busy repos the counts are returned as lower bounds with `truncated: true` instead of failing |
+| Read | `get_repo_activity_summary` | Issues opened, issues closed, distinct issues with comments, and opened issues by label, over 1 to 365 days. |
 | Propose | `propose_add_comment` | Queue a comment |
 | Propose | `propose_add_labels` | Queue label additions, checked against the repo's labels |
 | Propose | `propose_remove_labels` | Queue label removals |
@@ -91,15 +91,15 @@ Each process is started separately and loads only the credentials it needs, from
 
 ## Guardrails
 
-- **Before queuing:** Every read/propose call checks `repo_allowlist.active`. Deactivation preserves history, blocks new proposals, and marks already-queued proposals `blocked` at approval. Propose tools reject actions that can become stale by construction, such as closing a non-open issue or adding an existing label. `MAX_PENDING_PER_ISSUE` (10) and `MAX_PENDING_PER_INITIATOR` (500) are enforced transactionally using two ordered advisory locks. Duplicate `pending`/`approving` proposals for the same repo/issue/tool/args are dropped, preventing retry-induced double-queuing.
+- **Before queuing:** Every read/propose call checks `repo_allowlist.active`. Deactivation preserves history, blocks new proposals, and marks already-queued proposals `blocked` at approval. Propose tools also reject actions that can become stale by construction, such as closing a non-open issue or adding an existing label. `MAX_PENDING_PER_ISSUE` (10) and `MAX_PENDING_PER_INITIATOR` (500) are enforced transactionally using two ordered advisory locks. Duplicate `pending`/`approving` proposals for the same repo/issue/tool/args are dropped, preventing retry-induced double-queuing.
 
-- **At approval:** Only the dashboard holds the GitHub write token. Approval atomically changes `pending` → `approving` under a lease token required by every subsequent write, preventing concurrent execution without holding a DB lock across GitHub calls. Before writing, staleness is rechecked: changed title/body, closed target, missing removal label, duplicate comment, or deleted label for an add all block the proposal without affecting unrelated ones.
+- **At approval:** Only the dashboard holds the GitHub write token. Approval atomically changes from `pending` → `approving` under a lease token required by every write, preventing concurrent execution without holding a DB lock across GitHub calls. Before writing, staleness is rechecked: changed title/body, closed target, missing removal label, duplicate comment, or deleted label for an add all block the proposal without affecting unrelated ones.
 
-- **Around GitHub calls:** Calls time out after 15s; pagination errors instead of silently truncating. Unreadable GitHub releases the claim to `pending` for retry; only 404/410 fail permanently. Assignment responses are verified against GitHub. Mid-write network failures become `outcome_unknown`, never guessed. Post-write DB failures retry on a fresh connection, then become `recording_failed`. Every status transition, including claimant identity, is atomically recorded with its audit row.
+- **Around GitHub calls:** Calls time out after 15s; pagination errors instead of silently truncating. Unreadable GitHub releases the claim to `pending` for retry; only 404/410 fail permanently. Assignment responses are then verified against GitHub. Mid-write network failures become `outcome_unknown`, never guessed. Post-write DB failures retry on a fresh connection, then become `recording_failed`. Every status transition, including claimant identity, is atomically recorded with its audit row.
 
 - **Recovery:** `approving` rows stuck beyond `STUCK_APPROVING_RECOVERY_MINUTES` return to `pending` if the GitHub call never started, otherwise move to `needs_review` for human verification. Unknown outcomes are never auto-retried. Unapproved proposals expire after `PENDING_ACTION_TTL_HOURS` (48), with audit records.
 
-- **Dashboard and misc:** The dashboard requires `DASHBOARD_ACCESS_TOKEN` unless `DASHBOARD_ALLOW_INSECURE=true`. Review panels show model rationale and issue text within prompt-defined limits, flag truncation, require acknowledgement for flagged proposals, and optionally reload live data from GitHub. Allowlist names are lower-cased and reject `.`/`..` segments. `Config.__repr__` excludes credentials, preventing token leakage through logs.
+- **Dashboard and misc:** The dashboard requires `DASHBOARD_ACCESS_TOKEN` unless `DASHBOARD_ALLOW_INSECURE=true`. Review panels show model rationale and issue text within prompt-defined limits, flag truncation, require acknowledgement for flagged proposals, and optionally reload live data from GitHub. Allowlist names are lower-cased and reject `.`/`..` segments. `Config.__repr__` excludes credentials, preventing token leakage via logs.
 
 ## Safety
 
