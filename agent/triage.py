@@ -17,11 +17,11 @@ from groq import (
 )
 from psycopg import errors as pg_errors
 
-from agent.heuristics import is_heuristically_flagged
 from agent.prompts import SYSTEM_PROMPT, build_user_prompt
 from issueops import tools
 from issueops.config import Config, load_config
 from issueops.github_client import GitHubAPIError, GitHubReadClient
+from issueops.heuristics import is_heuristically_flagged
 from issueops.observability import configure_logfire
 
 DEFAULT_MODEL = "openai/gpt-oss-20b"
@@ -50,24 +50,37 @@ class ClassificationError(Exception):
     pass
 
 
+def _propose_add_labels(dsn, rc, repo, num, args, initiator, flagged, issue, max_body_chars=None, **limits):
+    return tools.propose_add_labels(
+        dsn, rc, repo, num, args["labels"], initiator, heuristic_flagged=flagged, issue=issue, **limits,
+    )
+
+
+def _propose_add_comment(dsn, rc, repo, num, args, initiator, flagged, issue, max_body_chars=None, **limits):
+    if max_body_chars:
+        limits["max_body_chars"] = max_body_chars
+    return tools.propose_add_comment(
+        dsn, rc, repo, num, args["body"], initiator, heuristic_flagged=flagged, issue=issue, **limits,
+    )
+
+
+def _propose_close(dsn, rc, repo, num, args, initiator, flagged, issue, max_body_chars=None, **limits):
+    return tools.propose_close(
+        dsn, rc, repo, num, args.get("reason"), initiator, heuristic_flagged=flagged, issue=issue, **limits,
+    )
+
+
+def _propose_assign(dsn, rc, repo, num, args, initiator, flagged, issue, max_body_chars=None, **limits):
+    return tools.propose_assign(
+        dsn, rc, repo, num, args["assignee"], initiator, heuristic_flagged=flagged, issue=issue, **limits,
+    )
+
+
 PROPOSE_DISPATCH = {
-    "propose_add_labels": lambda dsn, rc, repo, num, args, initiator, flagged, issue, rationale=None, max_body_chars=None, max_pending_per_issue=None, max_pending_per_initiator=None: tools.propose_add_labels(
-        dsn, rc, repo, num, args["labels"], initiator, heuristic_flagged=flagged, issue=issue, rationale=rationale,
-        max_pending_per_issue=max_pending_per_issue, max_pending_per_initiator=max_pending_per_initiator,
-    ),
-    "propose_add_comment": lambda dsn, rc, repo, num, args, initiator, flagged, issue, rationale=None, max_body_chars=None, max_pending_per_issue=None, max_pending_per_initiator=None: tools.propose_add_comment(
-        dsn, rc, repo, num, args["body"], initiator, heuristic_flagged=flagged, issue=issue, rationale=rationale,
-        max_pending_per_issue=max_pending_per_issue, max_pending_per_initiator=max_pending_per_initiator,
-        **({"max_body_chars": max_body_chars} if max_body_chars else {}),
-    ),
-    "propose_close": lambda dsn, rc, repo, num, args, initiator, flagged, issue, rationale=None, max_body_chars=None, max_pending_per_issue=None, max_pending_per_initiator=None: tools.propose_close(
-        dsn, rc, repo, num, args.get("reason"), initiator, heuristic_flagged=flagged, issue=issue, rationale=rationale,
-        max_pending_per_issue=max_pending_per_issue, max_pending_per_initiator=max_pending_per_initiator,
-    ),
-    "propose_assign": lambda dsn, rc, repo, num, args, initiator, flagged, issue, rationale=None, max_body_chars=None, max_pending_per_issue=None, max_pending_per_initiator=None: tools.propose_assign(
-        dsn, rc, repo, num, args["assignee"], initiator, heuristic_flagged=flagged, issue=issue, rationale=rationale,
-        max_pending_per_issue=max_pending_per_issue, max_pending_per_initiator=max_pending_per_initiator,
-    ),
+    "propose_add_labels": _propose_add_labels,
+    "propose_add_comment": _propose_add_comment,
+    "propose_close": _propose_close,
+    "propose_assign": _propose_assign,
 }
 
 
@@ -204,6 +217,14 @@ def _is_transient(exc: Exception) -> bool:
     return False
 
 
+def _is_rate_limit(exc: Exception) -> bool:
+    if isinstance(exc, RateLimitError):
+        return True
+    if isinstance(exc, GitHubAPIError):
+        return exc.status_code == 429 or (exc.status_code == 403 and "rate limit" in exc.message.lower())
+    return False
+
+
 def _is_fatal(exc: Exception) -> bool:
     if _is_transient(exc):
         return False
@@ -267,6 +288,8 @@ def run_triage(
     model: str = DEFAULT_MODEL, since: str | None = None, max_pages: int = 20,
     allow_comment: bool = False, allow_close: bool = False,
 ):
+    if max_issues is not None and max_issues < 1:
+        raise ValueError("max_issues must be a positive integer")
     repo = tools.normalize_repo(repo)
     config = load_config(require_write_pat=False, require_groq=True)
     configure_logfire(config.logfire_token, service_name="issueops-triage-agent")
@@ -281,7 +304,7 @@ def run_triage(
     unchanged = tools.list_triage_skips(dsn, repo)
     listing = tools.list_issue_candidates(
         dsn, read_client, repo, initiator, state=state, since=since,
-        max_pages=max_pages, limit=max_issues or None, exclude=handled, unchanged=unchanged,
+        max_pages=max_pages, limit=max_issues, exclude=handled, unchanged=unchanged,
     )
     candidates = listing["issues"]
     if listing["skipped"]:
@@ -361,7 +384,7 @@ def run_triage(
             fatal = _is_fatal(exc)
             if transient or fatal:
                 defer = True
-            if isinstance(exc, RateLimitError):
+            if _is_rate_limit(exc):
                 rate_limited = True
             results.append(
                 {
@@ -393,7 +416,7 @@ def run_triage(
 
         if rate_limited:
             print(
-                f"warning: the model provider is rate limiting requests; stopping after #{issue_number}. "
+                f"warning: the model provider or GitHub is rate limiting requests; stopping after #{issue_number}. "
                 "Issues that failed for this reason are not recorded as attempted and will be retried next run.",
                 file=sys.stderr,
             )
@@ -410,19 +433,23 @@ def run_triage(
     return results
 
 
-def run_scheduled(repo: str, state: str = "open", allow_comment: bool = False, allow_close: bool = False):
-    return run_triage(
-        repo, initiator="agent:scheduled", state=state, allow_comment=allow_comment, allow_close=allow_close,
-    )
+def _positive_int(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"must be an integer, got: {raw!r}")
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be a positive integer, got: {value}")
+    return value
 
 
 def main():
     parser = argparse.ArgumentParser(description="Run the IssueOps triage agent against one repo.")
     parser.add_argument("repo", help="owner/name of an allowlisted repo")
     parser.add_argument("--state", default="open")
-    parser.add_argument("--max-issues", type=int, default=None)
+    parser.add_argument("--max-issues", type=_positive_int, default=None)
     parser.add_argument("--since", default=None, help="only issues updated at or after this ISO 8601 timestamp")
-    parser.add_argument("--max-pages", type=int, default=20)
+    parser.add_argument("--max-pages", type=_positive_int, default=20)
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument(
         "--allow-comment", action="store_true",

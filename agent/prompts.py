@@ -41,15 +41,9 @@ def _sanitize_for_untrusted_block(text: str) -> str:
     return _MARKER_PATTERN.sub(_MARKER_REPLACEMENT, text or "")
 
 
-def _clip(text: str, limit: int) -> str:
-    if len(text) <= limit:
-        return text
-    return f"{text[:limit]}[truncated {len(text) - limit} chars]"
-
-
 def build_untrusted_block(issue: dict) -> str:
-    title = _clip(_sanitize_for_untrusted_block(issue.get("title") or ""), MAX_TITLE_CHARS)
-    body = _clip(_sanitize_for_untrusted_block(issue.get("body") or ""), MAX_BODY_CHARS)
+    title = limits.clip(_sanitize_for_untrusted_block(issue.get("title") or ""), MAX_TITLE_CHARS)
+    body = limits.clip(_sanitize_for_untrusted_block(issue.get("body") or ""), MAX_BODY_CHARS)
     all_comments = issue.get("comments_detail") or []
     recent_comments = all_comments[-MAX_COMMENTS:]
     comment_lines = []
@@ -57,9 +51,9 @@ def build_untrusted_block(issue: dict) -> str:
         comment_lines.append(f"[{len(all_comments) - len(recent_comments)} earlier comments omitted]")
     for comment in recent_comments:
         author = (comment.get("user") or {}).get("login") or "unknown"
-        text = _clip(_sanitize_for_untrusted_block(comment.get("body") or ""), MAX_COMMENT_CHARS)
+        text = limits.clip(_sanitize_for_untrusted_block(comment.get("body") or ""), MAX_COMMENT_CHARS)
         comment_lines.append(f"comment by {author}: {text}")
-    comments_text = _clip("\n".join(comment_lines), MAX_COMMENTS_TOTAL_CHARS)
+    comments_text = limits.clip("\n".join(comment_lines), MAX_COMMENTS_TOTAL_CHARS)
     return (
         f"{UNTRUSTED_START}\n"
         f"title: {title}\n"

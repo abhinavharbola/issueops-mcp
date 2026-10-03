@@ -120,9 +120,6 @@ def _inject_theme():
             text-transform: uppercase;
         }
 
-        /* Sidebar form controls. The dark rosewood sidebar background bleeds
-           through unless every layer of the widget (wrapper, input, the
-           number-input step buttons) is repainted explicitly. */
         section[data-testid="stSidebar"] div[data-testid="stTextInput"],
         section[data-testid="stSidebar"] div[data-testid="stNumberInput"] {
             background-color: transparent;
@@ -218,11 +215,6 @@ def _inject_theme():
             font-weight: 600;
         }
 
-        /* Alert boxes (st.error/warning/success/info). Streamlit paints the
-           semantic color on an inner notification element, so overriding
-           only the outer stAlert div left the old color showing through
-           underneath. Flatten every descendant to transparent first, then
-           repaint the whole stack in one flat, quiet color. */
         div[data-testid="stAlert"] * {
             background-color: transparent !important;
             background-image: none !important;
@@ -257,10 +249,14 @@ def _inject_theme():
 
 _inject_theme()
 
+@st.cache_resource
+def _get_github_clients(read_pat: str, write_pat: str):
+    return GitHubReadClient(read_pat), GitHubWriteClient(write_pat)
+
+
 config = load_config(require_write_pat=True)
 configure_logfire(config.logfire_token, service_name="issueops-dashboard")
-read_client = GitHubReadClient(config.github_read_pat)
-write_client = GitHubWriteClient(config.github_write_pat)
+read_client, write_client = _get_github_clients(config.github_read_pat, config.github_write_pat)
 
 
 @st.cache_resource
@@ -353,8 +349,8 @@ if "last_action_result" in st.session_state:
         )
     elif result.get("outcome_unknown"):
         st.warning(
-            f"The connection failed after the request may have reached GitHub. Check the issue on "
-            f"GitHub before proposing this action again: {result}",
+            f"The request may have reached GitHub before the call failed. The action is now under "
+            f"Needs review. Check the issue on GitHub and record what you found: {result}",
             icon=":material/warning:",
         )
     else:
@@ -421,7 +417,7 @@ def _render_pending_row(row):
         if row["tool_name"] == "propose_add_comment":
             st.write("Comment text (proposed)")
             st.text((row["arguments"].get("body") or "").strip() or "(empty)")
-        with st.expander("Raw arguments", expanded=False):
+        with st.popover("Raw arguments"):
             st.json(row["arguments"])
 
         if row.get("rationale"):
@@ -473,7 +469,7 @@ def _render_pending_row(row):
         st.caption(
             f"At proposal time: state={snapshot.get('state')}, labels={snap_labels}, assignees={snap_assignees}"
         )
-        with st.expander("Raw snapshot", expanded=False):
+        with st.popover("Raw snapshot"):
             st.json(row["issue_state_snapshot"])
 
         st.caption(f"Proposed by {row['requested_by']} at {row['created_at']}")
@@ -503,10 +499,6 @@ def _render_pending_row(row):
                         author = (comment.get("user") or {}).get("login") or "unknown"
                         st.caption(f"Comment by {author}")
                         st.text(comment.get("body") or "")
-                # heuristic_flagged is decided once, at proposal time, and stored on
-                # the row. The issue can be edited afterward to add injection content,
-                # and the button above fetches that live text, so re-run the same
-                # check against it rather than trusting the stale, stored flag alone.
                 live_flag_matches = flag_matches(tools.issue_plaintext(preview))
                 if live_flag_matches:
                     st.error(
@@ -521,6 +513,10 @@ def _render_pending_row(row):
                 "I read the flagged issue text and still want to act on this",
                 key=f"ack_{row['id']}",
             )
+
+        reject_reason = st.text_input(
+            "Reason for rejecting (optional)", key=f"reject_reason_{row['id']}", max_chars=500,
+        ).strip()
 
         col1, col2 = st.columns(2)
         with col1:
@@ -551,7 +547,7 @@ def _render_pending_row(row):
             ):
                 try:
                     with _connection() as conn:
-                        result = actions.reject_action(conn, row["id"], approver)
+                        result = actions.reject_action(conn, row["id"], approver, reject_reason or None)
                 except Exception as exc:
                     result = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
                 st.session_state.pop(preview_key, None)
@@ -569,10 +565,10 @@ else:
         st.warning("Enter your name in the sidebar to enable approve/reject.", icon=":material/warning:")
 
 
-def _resolve(action_id, applied):
+def _resolve(action_id, applied, note=None):
     try:
         with _connection() as conn:
-            result = actions.resolve_needs_review(conn, action_id, approver, applied)
+            result = actions.resolve_needs_review(conn, action_id, approver, applied, note or None)
     except Exception as exc:
         result = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
     st.session_state["last_action_result"] = result
@@ -586,8 +582,9 @@ if review_rows:
     st.divider()
     st.subheader("Needs review: outcome unknown")
     st.caption(
-        "An approval started its GitHub call and never recorded the result. It may or may not have been applied. "
-        "Open the issue on GitHub, check, and record what you found."
+        "An approval started its GitHub call and the result is unknown, either because the call failed in a way that "
+        "may have still applied it or because the outcome was never recorded. Open the issue on GitHub, check, "
+        "and record what you found."
     )
     for row in review_rows:
         header = f"{row['tool_name']} on {row['repo']}#{row['issue_number']}"
@@ -597,6 +594,9 @@ if review_rows:
                 f"Approval started by {row['claimed_by']} at {row['claimed_at']}; "
                 f"GitHub call started at {row['execution_started_at']}"
             )
+            resolve_note = st.text_input(
+                "What you found on GitHub (optional)", key=f"resolve_note_{row['id']}", max_chars=500,
+            ).strip()
             col1, col2 = st.columns(2)
             with col1:
                 if st.button(
@@ -605,7 +605,7 @@ if review_rows:
                     disabled=not approver,
                     icon=":material/check_circle:",
                 ):
-                    _resolve(row["id"], True)
+                    _resolve(row["id"], True, resolve_note)
             with col2:
                 if st.button(
                     "It was not applied, return to pending",
@@ -613,7 +613,7 @@ if review_rows:
                     disabled=not approver,
                     icon=":material/undo:",
                 ):
-                    _resolve(row["id"], False)
+                    _resolve(row["id"], False, resolve_note)
 
 st.divider()
 st.subheader("Recent audit log")
