@@ -5,6 +5,24 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
+AUDIT_COLUMNS = (
+    "tool_name", "repo", "issue_number", "arguments", "pending_action_id",
+    "initiator", "result_status", "result_summary", "latency_ms", "trace_id",
+)
+PENDING_INSERT_COLUMNS = (
+    "tool_name", "repo", "issue_number", "arguments", "issue_state_snapshot",
+    "heuristic_flagged", "requested_by", "source_excerpt", "rationale",
+)
+
+
+def audit_field(params, name):
+    return params[AUDIT_COLUMNS.index(name)]
+
+
+def pending_insert_field(params, name):
+    return params[PENDING_INSERT_COLUMNS.index(name)]
+
+
 class FakeCursor:
     def __init__(self, sql, params, conn):
         self.sql = " ".join(sql.split())

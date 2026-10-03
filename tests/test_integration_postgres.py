@@ -46,7 +46,7 @@ def _read_client():
     return client
 
 
-def _insert_pending(dsn, tool_name="propose_add_comment", arguments=None):
+def _insert_pending(dsn, tool_name="propose_add_comment", arguments=None, issue_number=7, requested_by="agent:test"):
     from psycopg.types.json import Jsonb
 
     with tools.sync_connection(dsn) as conn:
@@ -54,13 +54,15 @@ def _insert_pending(dsn, tool_name="propose_add_comment", arguments=None):
             """
             INSERT INTO pending_actions
                 (tool_name, repo, issue_number, arguments, issue_state_snapshot, requested_by)
-            VALUES (%s, 'owner/repo', 7, %s, %s, 'agent:test')
+            VALUES (%s, 'owner/repo', %s, %s, %s, %s)
             RETURNING id
             """,
             (
                 tool_name,
+                issue_number,
                 Jsonb(arguments or {"body": "hello"}),
                 Jsonb({"state": "open", "labels": [], "assignees": []}),
+                requested_by,
             ),
         ).fetchone()
     return str(row["id"])
@@ -757,10 +759,8 @@ def test_triage_attempts_skip_unchanged_issues_but_reconsider_edited_ones(dsn):
     digest = tools.content_hash("t", "b")
     tools.record_triage_attempt(dsn, "owner/repo", 1, digest, "no_action")
     tools.record_triage_attempt(dsn, "owner/repo", 2, digest, "proposed")
+    _insert_pending(dsn, issue_number=2, requested_by="alice")
 
-    # 'proposed' counts as unchanged here too, not just 'no_action': see the
-    # comment on list_triage_skips for why a dedup-only 'proposed' outcome must
-    # also be skipped on future runs.
     assert tools.list_triage_skips(dsn, "owner/repo") == {1: digest, 2: digest}
 
     read_client = MagicMock()
@@ -776,6 +776,79 @@ def test_triage_attempts_skip_unchanged_issues_but_reconsider_edited_ones(dsn):
     read_client.iter_issue_pages.return_value = [[{"number": 1, "title": "t", "body": "edited"}]]
     result = tools.list_issue_candidates(dsn, read_client, "owner/repo", "agent:test", unchanged=unchanged)
     assert [i["number"] for i in result["issues"]] == [1]
+
+
+@pytest.mark.parametrize("status", ["expired", "failed", "stale"])
+def test_a_proposed_issue_whose_proposal_died_is_reconsidered(dsn, status):
+    digest = tools.content_hash("t", "b")
+    tools.record_triage_attempt(dsn, "owner/repo", 2, digest, "proposed")
+    action_id = _insert_pending(dsn, issue_number=2)
+    with tools.sync_connection(dsn) as conn:
+        conn.execute("UPDATE pending_actions SET status = %s WHERE id = %s", (status, action_id))
+
+    assert 2 not in tools.list_triage_skips(dsn, "owner/repo")
+
+
+def test_a_requeued_action_gets_a_fresh_expiry_window(dsn):
+    action_id = _insert_pending(dsn)
+    with tools.sync_connection(dsn) as conn:
+        conn.execute(
+            "UPDATE pending_actions SET status = 'needs_review', created_at = now() - interval '100 hours', "
+            "claimed_by = 'alice', claimed_at = now(), execution_started_at = now() WHERE id = %s",
+            (action_id,),
+        )
+        result = actions.resolve_needs_review(conn, action_id, "bob", applied=False)
+        assert result == {"status": "requeued"}
+        expired = actions.expire_stale_pending(conn, ttl_hours=48)
+
+    assert expired == []
+    assert _status(dsn, action_id) == "pending"
+
+
+def test_an_unknown_write_outcome_lands_in_needs_review(dsn):
+    import requests
+
+    action_id = _insert_pending(dsn)
+    write_client = MagicMock()
+    write_client.add_comment.side_effect = requests.exceptions.ReadTimeout("timed out")
+
+    with tools.sync_connection(dsn) as conn:
+        result = actions.approve_action(conn, _read_client(), write_client, action_id, "alice", dsn=dsn)
+
+    assert result["status"] == "needs_review"
+    assert _status(dsn, action_id) == "needs_review"
+
+
+def test_migrate_applies_nothing_after_the_schema_and_everything_on_a_bare_recorded_database(dsn):
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    import migrate
+
+    assert migrate.run_migrations(dsn) == []
+
+    with tools.sync_connection(dsn) as conn:
+        conn.execute("DELETE FROM schema_migrations")
+
+    applied = migrate.run_migrations(dsn)
+
+    assert applied == sorted(path.name for path in migrate.MIGRATIONS_DIR.glob("*.sql"))
+    assert migrate.run_migrations(dsn) == []
+
+
+def test_the_schema_can_be_reapplied_without_touching_existing_constraints(dsn):
+    import psycopg
+
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        before = conn.execute(
+            "SELECT conname, oid FROM pg_constraint WHERE conrelid = 'pending_actions'::regclass ORDER BY conname"
+        ).fetchall()
+        conn.execute(SCHEMA_PATH.read_text())
+        after = conn.execute(
+            "SELECT conname, oid FROM pg_constraint WHERE conrelid = 'pending_actions'::regclass ORDER BY conname"
+        ).fetchall()
+
+    assert before == after
 
 
 def test_an_issue_that_keeps_failing_is_retried_a_bounded_number_of_times(dsn):
@@ -893,3 +966,25 @@ def test_the_allowlist_rejects_path_traversal_names_in_the_script_and_in_the_dat
     with tools.sync_connection(dsn) as conn:
         names = [r["repo"] for r in conn.execute("SELECT repo FROM repo_allowlist ORDER BY repo").fetchall()]
     assert "some-org/some.repo_1" in names
+
+
+def _load_migrate_script():
+    import importlib.util
+
+    path = Path(__file__).resolve().parent.parent / "scripts" / "migrate.py"
+    spec = importlib.util.spec_from_file_location("issueops_migrate_script", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_migrate_applies_only_unrecorded_files_and_is_repeatable(dsn):
+    migrate = _load_migrate_script()
+
+    assert migrate.run_migrations(dsn) == []
+
+    with tools.sync_connection(dsn) as conn:
+        conn.execute("DELETE FROM schema_migrations WHERE version = '003_requeued_at.sql'")
+
+    assert migrate.run_migrations(dsn) == ["003_requeued_at.sql"]
+    assert migrate.run_migrations(dsn) == []

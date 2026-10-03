@@ -271,3 +271,38 @@ def test_repr_never_contains_a_secret(monkeypatch):
     rendered = repr(loaded) + str(loaded)
     for value in secrets.values():
         assert value not in rendered
+
+
+def test_a_comment_limit_above_githubs_ceiling_is_rejected(monkeypatch):
+    _clear_env(monkeypatch)
+    _set_minimum_required_env(monkeypatch)
+    monkeypatch.setenv("COMMENT_BODY_MAX_CHARS", "65537")
+
+    with pytest.raises(RuntimeError, match="at most 65536"):
+        config.load_config(require_write_pat=False)
+
+
+def test_a_comment_limit_at_githubs_ceiling_is_accepted(monkeypatch):
+    _clear_env(monkeypatch)
+    _set_minimum_required_env(monkeypatch)
+    monkeypatch.setenv("COMMENT_BODY_MAX_CHARS", "65536")
+
+    assert config.load_config(require_write_pat=False).comment_body_max_chars == 65536
+
+
+def test_load_neon_dsn_needs_only_the_dsn_and_drops_the_write_pat(monkeypatch):
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("ISSUEOPS_ENV_FILE", os.devnull)
+    monkeypatch.setenv("NEON_DSN", "postgresql://fake")
+    monkeypatch.setenv("GITHUB_WRITE_PAT", "write-pat")
+
+    assert config.load_neon_dsn() == "postgresql://fake"
+    assert "GITHUB_WRITE_PAT" not in os.environ
+
+
+def test_load_neon_dsn_raises_when_the_dsn_is_missing(monkeypatch):
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("ISSUEOPS_ENV_FILE", os.devnull)
+
+    with pytest.raises(RuntimeError, match="NEON_DSN"):
+        config.load_neon_dsn()

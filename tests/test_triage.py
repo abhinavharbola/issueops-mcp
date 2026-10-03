@@ -3,8 +3,6 @@ from unittest.mock import MagicMock
 
 import pytest
 
-import json
-
 import httpx
 
 import agent.triage as triage
@@ -679,18 +677,45 @@ def test_a_systemic_failure_stops_the_run_and_never_blacklists_an_issue(monkeypa
     assert "configuration or permission problem" in capsys.readouterr().err
 
 
-def test_a_github_rate_limit_403_is_transient_not_fatal(monkeypatch, patched):
+def test_a_github_rate_limit_403_is_transient_and_stops_the_run(monkeypatch, patched, capsys):
     _listing(monkeypatch, [{"number": 1, "title": "t", "body": "b"}, {"number": 2, "title": "t", "body": "b"}])
     monkeypatch.setattr(triage.tools, "get_issue", MagicMock(side_effect=lambda *a, **k: _issue(a[3])))
-    monkeypatch.setattr(
-        triage, "classify_issue", MagicMock(side_effect=triage.GitHubAPIError(403, "API rate limit exceeded"))
-    )
+    classify = MagicMock(side_effect=triage.GitHubAPIError(403, "API rate limit exceeded"))
+    monkeypatch.setattr(triage, "classify_issue", classify)
 
     results = triage.run_triage("owner/repo", "test")
 
-    assert [r["issue_number"] for r in results] == [1, 2]
-    assert all(r["fatal"] is False and r["transient"] is True for r in results)
+    assert [r["issue_number"] for r in results] == [1]
+    assert results[0]["fatal"] is False and results[0]["transient"] is True
+    assert classify.call_count == 1
     patched.assert_not_called()
+    assert "rate limiting" in capsys.readouterr().err
+
+
+def test_a_github_429_also_stops_the_run(monkeypatch, patched):
+    _listing(monkeypatch, [{"number": n, "title": "t", "body": "b"} for n in (1, 2, 3)])
+    monkeypatch.setattr(triage.tools, "get_issue", MagicMock(side_effect=lambda *a, **k: _issue(a[3])))
+    monkeypatch.setattr(triage, "classify_issue", MagicMock(side_effect=triage.GitHubAPIError(429, "slow down")))
+
+    results = triage.run_triage("owner/repo", "test")
+
+    assert [r["issue_number"] for r in results] == [1]
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_run_triage_rejects_a_non_positive_max_issues(value):
+    with pytest.raises(ValueError):
+        triage.run_triage("owner/repo", "test", max_issues=value)
+
+
+@pytest.mark.parametrize("value", ["0", "-3", "x"])
+def test_main_rejects_a_non_positive_max_issues(monkeypatch, value):
+    monkeypatch.setattr(triage.sys, "argv", ["triage", "owner/repo", "--max-issues", value])
+
+    with pytest.raises(SystemExit) as exit_info:
+        triage.main()
+
+    assert exit_info.value.code == 2
 
 
 def test_main_exits_nonzero_when_the_run_hit_a_systemic_failure(monkeypatch, capsys):

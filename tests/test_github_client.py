@@ -85,6 +85,13 @@ def test_remove_label_url_encodes_a_label_with_a_slash():
     assert url.endswith("/labels/area%2Fbackend")
 
 
+def _all_issues(client, repo, **kwargs):
+    issues = []
+    for page in client.iter_issue_pages(repo, **kwargs):
+        issues.extend(page)
+    return issues
+
+
 def test_list_issues_follows_link_header_pagination():
     client = GitHubReadClient("fake-pat")
     page1 = _mock_response(
@@ -95,7 +102,7 @@ def test_list_issues_follows_link_header_pagination():
     page2 = _mock_response(200, json_data=[{"number": 2}], headers={})
     client._session.request = MagicMock(side_effect=[page1, page2])
 
-    issues = client.list_issues("owner/repo")
+    issues = _all_issues(client, "owner/repo")
 
     assert [i["number"] for i in issues] == [1, 2]
 
@@ -105,7 +112,7 @@ def test_list_issues_stops_when_there_is_no_next_link():
     page1 = _mock_response(200, json_data=[{"number": 1}], headers={})
     client._session.request = MagicMock(return_value=page1)
 
-    issues = client.list_issues("owner/repo")
+    issues = _all_issues(client, "owner/repo")
 
     assert [i["number"] for i in issues] == [1]
     assert client._session.request.call_count == 1
@@ -190,7 +197,7 @@ def test_list_issues_passes_max_pages_to_the_pagination_guard():
     client._session.request = MagicMock(return_value=first)
 
     with pytest.raises(PaginationLimitExceededError):
-        client.list_issues("o/r", max_pages=1)
+        _all_issues(client, "o/r", max_pages=1)
 
 
 def test_link_header_with_a_comma_inside_the_url_still_paginates():
@@ -203,7 +210,7 @@ def test_link_header_with_a_comma_inside_the_url_still_paginates():
     page2 = _mock_response(200, json_data=[{"number": 2}], headers={})
     client._session.request = MagicMock(side_effect=[page1, page2])
 
-    issues = client.list_issues("o/r")
+    issues = _all_issues(client, "o/r")
 
     assert [i["number"] for i in issues] == [1, 2]
     assert client._session.request.call_args_list[1].args[1].endswith("labels=a,b&page=2")
@@ -217,7 +224,27 @@ def test_a_pagination_link_pointing_outside_the_api_is_rejected():
     client._session.request = MagicMock(return_value=page1)
 
     with pytest.raises(GitHubAPIError):
-        client.list_issues("o/r")
+        _all_issues(client, "o/r")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://api.github.com.evil.example/x?page=2",
+        "https://api.github.com@evil.example/x?page=2",
+        "http://api.github.com/repos/o/r/issues?page=2",
+        "https://evil.example/repos/o/r/issues?page=2",
+    ],
+)
+def test_lookalike_pagination_hosts_are_rejected(url):
+    client = GitHubReadClient("fake-pat")
+    page1 = _mock_response(200, json_data=[{"number": 1}], headers={"Link": f'<{url}>; rel="next"'})
+    client._session.request = MagicMock(return_value=page1)
+
+    with pytest.raises(GitHubAPIError):
+        _all_issues(client, "o/r")
+
+    assert client._session.request.call_count == 1
 
 
 def test_iter_issue_pages_yields_page_by_page_and_stops_early_without_extra_requests():

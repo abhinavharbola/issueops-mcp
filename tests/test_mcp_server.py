@@ -1,4 +1,5 @@
 import importlib
+import os
 
 import pytest
 import requests
@@ -6,6 +7,10 @@ import requests
 
 @pytest.fixture
 def server_module(monkeypatch):
+    import issueops.config as config
+
+    monkeypatch.setenv("ISSUEOPS_ENV_FILE", os.devnull)
+    monkeypatch.setattr(config, "_write_pat_dropped_in_process", False)
     monkeypatch.setenv("NEON_DSN", "postgresql://fake")
     monkeypatch.setenv("GITHUB_READ_PAT", "fake-read-pat")
     monkeypatch.setenv("GROQ_API_KEY", "fake-groq-key")

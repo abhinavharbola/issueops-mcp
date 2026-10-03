@@ -1,4 +1,4 @@
-from agent.heuristics import HEURISTIC_PHRASES, is_heuristically_flagged
+from issueops.heuristics import HEURISTIC_PHRASES, is_heuristically_flagged
 
 
 def test_flags_known_injection_phrase():
@@ -19,11 +19,8 @@ def test_every_listed_phrase_actually_triggers_the_flag():
         assert is_heuristically_flagged(f"some text before {phrase} some text after")
 
 
-def test_agent_heuristics_is_a_re_export_of_the_canonical_issueops_module():
-    import issueops.heuristics as canonical
-
-    assert HEURISTIC_PHRASES is canonical.HEURISTIC_PHRASES
-    assert is_heuristically_flagged is canonical.is_heuristically_flagged
+def test_ordinary_phrasing_that_only_shares_words_with_a_phrase_is_not_flagged():
+    assert not is_heuristically_flagged("The tool will act as if the cache were empty, and you are now logged out.")
 
 
 def test_zero_width_characters_inside_a_phrase_do_not_evade_the_flag():

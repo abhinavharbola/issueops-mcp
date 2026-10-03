@@ -4,7 +4,8 @@ from unittest.mock import MagicMock
 import pytest
 
 import issueops.tools as tools
-from conftest import FakeConn, sync_connection_returning
+from conftest import FakeConn, audit_field, pending_insert_field, sync_connection_returning
+from issueops import limits
 from issueops.github_client import PaginationLimitExceededError
 
 
@@ -73,7 +74,7 @@ def test_a_rejected_search_is_recorded_in_the_audit_log(monkeypatch):
         tools.search_issues("dsn", MagicMock(), "owner/repo", "repo:other/x y", "test")
 
     audit_inserts = [q for q in conn.queries if "INSERT INTO audit_log" in q[0]]
-    assert audit_inserts and audit_inserts[-1][1][6] == "error"
+    assert audit_inserts and audit_field(audit_inserts[-1][1], "result_status") == "error"
 
 
 @pytest.mark.parametrize("days", [0, -1, 366, "7", True])
@@ -197,7 +198,8 @@ def test_list_issue_candidates_is_recorded_in_the_audit_log(monkeypatch):
     tools.list_issue_candidates("dsn", read_client, "owner/repo", "test")
 
     audit_inserts = [q for q in conn.queries if "INSERT INTO audit_log" in q[0]]
-    assert audit_inserts and audit_inserts[-1][1][6] == "ok"
+    assert audit_inserts and audit_field(audit_inserts[-1][1], "result_status") == "ok"
+    assert audit_field(audit_inserts[-1][1], "tool_name") == "list_issue_candidates"
 
 
 def test_read_tools_normalize_the_repo_name_before_the_allowlist_check(monkeypatch):
@@ -266,6 +268,19 @@ def test_list_issues_returns_at_most_the_limit_and_says_when_it_cut_the_list(mon
 
     assert [i["number"] for i in result["issues"]] == list(range(1, 31))
     assert result["truncated"] is True
+
+
+def test_list_issues_leaves_out_pull_requests_and_does_not_count_them_against_the_limit(monkeypatch):
+    _use_conn(monkeypatch)
+    read_client = MagicMock()
+    read_client.iter_issue_pages.return_value = iter(
+        [[{"number": 1}, {"number": 2, "pull_request": {}}, {"number": 3}]]
+    )
+
+    result = tools.list_issues("dsn", read_client, "owner/repo", "test", limit=2)
+
+    assert [i["number"] for i in result["issues"]] == [1, 3]
+    assert result["truncated"] is False
 
 
 def test_list_issues_does_not_fetch_more_pages_than_the_limit_needs(monkeypatch):
@@ -363,7 +378,7 @@ def test_a_rejected_limit_is_recorded_as_an_error_in_the_audit_log(monkeypatch):
         tools.list_issues("dsn", MagicMock(), "owner/repo", "test", limit=0)
 
     audit_inserts = [q for q in conn.queries if "INSERT INTO audit_log" in q[0]]
-    assert audit_inserts and audit_inserts[-1][1][6] == "error"
+    assert audit_inserts and audit_field(audit_inserts[-1][1], "result_status") == "error"
 
 
 
@@ -400,6 +415,29 @@ def test_propose_close_rejects_invalid_reason(monkeypatch):
     _patch_sync_connection(monkeypatch, FakeConn())
     with pytest.raises(tools.ValidationError):
         tools.propose_close("dsn", _read_client(), "owner/repo", 1, "not-a-real-reason", "test")
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda rc: tools.propose_close("dsn", rc, "owner/repo", 1, "completed", "test"),
+        lambda rc: tools.propose_add_comment("dsn", rc, "owner/repo", 1, "hello", "test"),
+        lambda rc: tools.propose_add_labels("dsn", rc, "owner/repo", 1, ["bug"], "test"),
+        lambda rc: tools.propose_assign("dsn", rc, "owner/repo", 1, "octocat", "test"),
+    ],
+)
+def test_proposals_against_a_pull_request_are_rejected(monkeypatch, call):
+    fake_conn = FakeConn()
+    _patch_sync_connection(monkeypatch, fake_conn)
+    read_client = _read_client(
+        get_issue_return={"state": "open", "labels": [], "assignees": [], "pull_request": {"url": "x"}},
+        labels=["bug"],
+    )
+
+    with pytest.raises(tools.ValidationError, match="pull request"):
+        call(read_client)
+
+    assert not any("INSERT INTO pending_actions" in sql for sql, _ in fake_conn.queries)
 
 
 def test_propose_close_accepts_a_valid_reason(monkeypatch):
@@ -814,10 +852,10 @@ def test_the_excerpt_contains_everything_the_classifier_prompt_contains():
 
     excerpt = tools.build_source_excerpt(issue)
 
-    assert excerpt["title"] == prompts._clip(issue["title"], prompts.MAX_TITLE_CHARS)
-    assert excerpt["body"] == prompts._clip(issue["body"], prompts.MAX_BODY_CHARS)
+    assert excerpt["title"] == limits.clip(issue["title"], prompts.MAX_TITLE_CHARS)
+    assert excerpt["body"] == limits.clip(issue["body"], prompts.MAX_BODY_CHARS)
     assert len(excerpt["comments"]) == prompts.MAX_COMMENTS
-    assert excerpt["comments"][0]["body"] == prompts._clip(issue["comments_detail"][0]["body"], prompts.MAX_COMMENT_CHARS)
+    assert excerpt["comments"][0]["body"] == limits.clip(issue["comments_detail"][0]["body"], prompts.MAX_COMMENT_CHARS)
     assert excerpt["text_truncated"] is True
 
 
@@ -854,4 +892,4 @@ def test_the_rationale_is_stored_clipped(monkeypatch):
     )
 
     params = _insert_params(fake_conn)
-    assert params[8].endswith("[truncated 100 chars]")
+    assert pending_insert_field(params, "rationale").endswith("[truncated 100 chars]")

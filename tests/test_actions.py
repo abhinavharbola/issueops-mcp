@@ -7,7 +7,7 @@ import requests
 
 import issueops.actions as actions
 import issueops.tools as tools
-from conftest import FakeConn
+from conftest import FakeConn, audit_field
 from issueops.github_client import GitHubAPIError
 
 
@@ -53,6 +53,27 @@ def test_approve_action_expires_when_past_the_configured_ttl():
     assert result["status"] == "expired"
     write_client.add_comment.assert_not_called()
     assert any("status = 'expired'" in sql for sql, _ in conn.queries)
+
+
+def test_a_requeued_row_is_measured_from_its_requeue_time_not_its_creation():
+    now = datetime.now(timezone.utc)
+    row = _pending_row(created_at=now - timedelta(hours=100))
+    row["requeued_at"] = now - timedelta(hours=1)
+    row["db_now"] = now
+    conn = FakeConn(pending_action_row=row)
+
+    result = actions.approve_action(conn, _read_client(), MagicMock(), "action-1", "alice", ttl_hours=48)
+
+    assert result["status"] == "executed"
+
+
+def test_expire_stale_pending_measures_from_the_requeue_time_when_present():
+    conn = FakeConn()
+
+    actions.expire_stale_pending(conn)
+
+    sql, _ = conn.queries[0]
+    assert "COALESCE(requeued_at, created_at)" in sql
 
 
 def test_approve_action_respects_a_custom_ttl():
@@ -187,9 +208,35 @@ def test_a_network_failure_during_the_write_is_reported_as_outcome_unknown():
 
     result = actions.approve_action(conn, _read_client(), write_client, "action-1", "alice")
 
-    assert result["status"] == "failed"
+    assert result["status"] == "needs_review"
     assert result["outcome_unknown"] is True
     assert "outcome unknown" in result["error"]
+    update_params = [params for sql, params in conn.queries if "SET status = %s, failure_reason = %s" in sql]
+    assert update_params and update_params[0][0] == "needs_review"
+
+
+def test_a_github_server_error_during_the_write_is_reported_as_outcome_unknown():
+    row = _pending_row()
+    conn = FakeConn(pending_action_row=row)
+    write_client = MagicMock()
+    write_client.add_comment.side_effect = GitHubAPIError(502, "bad gateway")
+
+    result = actions.approve_action(conn, _read_client(), write_client, "action-1", "alice")
+
+    assert result["status"] == "needs_review"
+    assert result["outcome_unknown"] is True
+
+
+def test_a_github_client_error_during_the_write_is_a_definite_failure():
+    row = _pending_row()
+    conn = FakeConn(pending_action_row=row)
+    write_client = MagicMock()
+    write_client.add_comment.side_effect = GitHubAPIError(422, "unprocessable")
+
+    result = actions.approve_action(conn, _read_client(), write_client, "action-1", "alice")
+
+    assert result["status"] == "failed"
+    assert "outcome_unknown" not in result
 
 
 def test_an_http_error_from_github_is_not_reported_as_outcome_unknown():
@@ -302,8 +349,8 @@ def test_approve_action_reports_lost_lease_not_failed_when_lease_reclaimed_befor
     assert result["status"] == "lost_lease"
     write_client.add_comment.assert_not_called()
     audit_inserts = [params for sql, params in conn.queries if "INSERT INTO audit_log" in sql]
-    assert not any(params[6] == "failed" for params in audit_inserts)
-    assert any(params[6] == "lost_lease" for params in audit_inserts)
+    assert not any(audit_field(params, "result_status") == "failed" for params in audit_inserts)
+    assert any(audit_field(params, "result_status") == "lost_lease" for params in audit_inserts)
 
 
 def test_approve_action_flags_a_lost_lease_when_github_call_raises_after_lease_lost():
@@ -338,7 +385,7 @@ def test_a_transient_read_failure_releases_the_claim_instead_of_failing_the_acti
     assert any("status = 'pending', claimed_at = NULL" in sql for sql, _ in conn.queries)
     assert not any("status = 'failed'" in sql for sql, _ in conn.queries)
     audit_inserts = [params for sql, params in conn.queries if "INSERT INTO audit_log" in sql]
-    assert any(params[6] == "released" for params in audit_inserts)
+    assert any(audit_field(params, "result_status") == "released" for params in audit_inserts)
 
 
 def test_a_github_auth_failure_on_the_read_releases_the_claim():
@@ -440,7 +487,8 @@ def test_approve_action_marks_failed_when_github_call_raises():
 
     assert result["status"] == "failed"
     assert "GitHub 500" in result["error"]
-    assert any("status = 'failed'" in sql for sql, _ in conn.queries)
+    status_updates = [params for sql, params in conn.queries if "SET status = %s, failure_reason = %s" in sql]
+    assert status_updates and status_updates[0][0] == "failed"
 
 
 def test_a_second_approve_after_the_row_is_claimed_finds_it_already_gone():
@@ -543,7 +591,7 @@ def test_a_network_failure_while_removing_labels_is_still_reported_as_outcome_un
 
     result = actions.approve_action(conn, read_client, write_client, "action-1", "alice")
 
-    assert result["status"] == "failed"
+    assert result["status"] == "needs_review"
     assert result["outcome_unknown"] is True
 
 
@@ -569,7 +617,7 @@ def test_claim_compares_the_row_age_against_the_database_clock():
 
 
 def _audit_statuses(conn):
-    return [params[6] for sql, params in conn.queries if "INSERT INTO audit_log" in sql]
+    return [audit_field(params, "result_status") for sql, params in conn.queries if "INSERT INTO audit_log" in sql]
 
 
 def test_the_claim_writes_its_own_audit_row_and_records_the_approver():
@@ -589,7 +637,7 @@ def test_the_executed_status_and_its_audit_row_are_written_in_the_same_transacti
 
     def tracking_execute(sql, params=None):
         if "INSERT INTO audit_log" in sql:
-            in_transaction_at_audit[params[6]] = conn.in_transaction
+            in_transaction_at_audit[audit_field(params, "result_status")] = conn.in_transaction
         return original_execute(sql, params)
 
     conn.execute = tracking_execute
@@ -609,7 +657,7 @@ def test_a_failed_github_call_writes_its_audit_row_in_the_same_transaction_as_th
 
     def tracking_execute(sql, params=None):
         if "INSERT INTO audit_log" in sql:
-            in_transaction_at_audit[params[6]] = conn.in_transaction
+            in_transaction_at_audit[audit_field(params, "result_status")] = conn.in_transaction
         return original_execute(sql, params)
 
     conn.execute = tracking_execute
@@ -639,7 +687,7 @@ def test_expiring_pending_actions_audits_each_expired_row():
 
     assert rows == expired
     audit_params = next(params for sql, params in conn.queries if "INSERT INTO audit_log" in sql)
-    assert audit_params[5] == "system:expiry" and audit_params[6] == "expired"
+    assert audit_field(audit_params, "initiator") == "system:expiry" and audit_field(audit_params, "result_status") == "expired"
 
 
 def test_the_add_labels_approval_goes_stale_when_a_label_no_longer_exists_on_the_repo():
@@ -792,6 +840,8 @@ def test_resolving_as_not_applied_requeues_it_and_clears_the_marker():
     update_sql = next(sql for sql, _ in conn.queries if sql.startswith("UPDATE pending_actions"))
     assert "status = 'pending'" in update_sql
     assert "execution_started_at = NULL" in update_sql
+    assert "requeued_at = now()" in update_sql
+    assert "failure_reason = NULL" in update_sql
     audit_params = next(params for sql, params in conn.queries if "INSERT INTO audit_log" in sql)
     assert "requeued" in audit_params
 
