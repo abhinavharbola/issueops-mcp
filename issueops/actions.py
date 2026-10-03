@@ -23,6 +23,13 @@ def _is_permanent_read_failure(exc: Exception) -> bool:
     return isinstance(exc, GitHubAPIError) and exc.status_code in PERMANENT_READ_FAILURE_STATUSES
 
 
+def _is_outcome_unknown(exc: Exception) -> bool:
+    cause = exc.__cause__ or exc
+    if isinstance(cause, requests.exceptions.RequestException):
+        return True
+    return isinstance(cause, GitHubAPIError) and cause.status_code >= 500
+
+
 def _record_with_retry(conn, dsn, operation):
     last_exc = None
     for attempt in range(RECORD_ATTEMPTS):
@@ -69,7 +76,7 @@ def expire_stale_pending(conn, ttl_hours: int = DEFAULT_PENDING_ACTION_TTL_HOURS
             """
             UPDATE pending_actions
             SET status = 'expired'
-            WHERE status = 'pending' AND created_at < now() - (%s * interval '1 hour')
+            WHERE status = 'pending' AND COALESCE(requeued_at, created_at) < now() - (%s * interval '1 hour')
             RETURNING id, tool_name, repo, issue_number, arguments
             """,
             (ttl_hours,),
@@ -94,7 +101,8 @@ def recover_stuck_approving(conn, minutes: int = DEFAULT_STUCK_APPROVING_RECOVER
             UPDATE pending_actions p
             SET status = CASE WHEN stuck.execution_started_at IS NULL THEN 'pending' ELSE 'needs_review' END,
                 claimed_at = CASE WHEN stuck.execution_started_at IS NULL THEN NULL ELSE p.claimed_at END,
-                claimed_by = CASE WHEN stuck.execution_started_at IS NULL THEN NULL ELSE p.claimed_by END
+                claimed_by = CASE WHEN stuck.execution_started_at IS NULL THEN NULL ELSE p.claimed_by END,
+                requeued_at = CASE WHEN stuck.execution_started_at IS NULL THEN now() ELSE p.requeued_at END
             FROM stuck
             WHERE p.id = stuck.id
             RETURNING p.id, p.tool_name, p.repo, p.issue_number, p.arguments, p.status,
@@ -208,7 +216,8 @@ def _claim_pending_action(conn, action_id: str, approver: str, ttl_hours: int):
 
         tool_name, repo, issue_number, arguments = row["tool_name"], row["repo"], row["issue_number"], row["arguments"]
 
-        if row["created_at"] < row["db_now"] - timedelta(hours=ttl_hours):
+        expiry_anchor = row.get("requeued_at") or row["created_at"]
+        if expiry_anchor < row["db_now"] - timedelta(hours=ttl_hours):
             conn.execute("UPDATE pending_actions SET status = 'expired' WHERE id = %s", (action_id,))
             tools.write_audit_log(conn, tool_name, repo, issue_number, arguments, action_id, approver, "expired", "expired between page load and approve click", 0)
             return None, None, {"status": "expired"}
@@ -333,17 +342,18 @@ def approve_action(
     try:
         _execute_on_github(write_client, tool_name, repo, issue_number, arguments)
     except Exception as exc:
-        outcome_unknown = isinstance(exc.__cause__ or exc, requests.exceptions.RequestException)
-        message = (
-            f"outcome unknown, the request may have been applied before the connection failed: {exc}"
-            if outcome_unknown
-            else str(exc)
-        )
+        outcome_unknown = _is_outcome_unknown(exc)
+        if outcome_unknown:
+            status = "needs_review"
+            message = f"outcome unknown, the request may have been applied before the call failed: {exc}"
+        else:
+            status = "failed"
+            message = str(exc)
         try:
             finished = _finish_recorded(
-                conn, dsn, action_id, lease, "SET status = 'failed', failure_reason = %s", (message,),
-                (tool_name, repo, issue_number, arguments, action_id, approver, "failed", message, 0),
-                "failed",
+                conn, dsn, action_id, lease, "SET status = %s, failure_reason = %s", (status, message),
+                (tool_name, repo, issue_number, arguments, action_id, approver, status, message, 0),
+                status,
             )
         except RecordingFailedError as recording_error:
             return {
@@ -353,7 +363,7 @@ def approve_action(
                 "outcome_unknown": outcome_unknown,
             }
         if finished:
-            result = {"status": "failed", "error": message}
+            result = {"status": status, "error": message}
             if outcome_unknown:
                 result["outcome_unknown"] = True
             return result
@@ -438,7 +448,8 @@ def resolve_needs_review(conn, action_id: str, resolver: str, applied: bool, not
         conn.execute(
             """
             UPDATE pending_actions
-            SET status = 'pending', claimed_at = NULL, claimed_by = NULL, execution_started_at = NULL
+            SET status = 'pending', claimed_at = NULL, claimed_by = NULL, execution_started_at = NULL,
+                failure_reason = NULL, requeued_at = now()
             WHERE id = %s
             """,
             (action_id,),

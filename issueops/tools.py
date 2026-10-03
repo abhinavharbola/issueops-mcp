@@ -1,6 +1,5 @@
 import hashlib
 import json
-import os
 import re
 import threading
 import time
@@ -11,7 +10,7 @@ from psycopg.types.json import Jsonb
 from issueops import limits
 from issueops.db import sync_connection
 from issueops.github_client import GitHubReadClient, PaginationLimitExceededError
-from issueops.heuristics import flag_matches, is_heuristically_flagged
+from issueops.heuristics import flag_matches
 
 VALID_CLOSE_REASONS = {"completed", "not_planned", None}
 
@@ -68,19 +67,6 @@ class QueueFullError(ValidationError):
 
 def _now_ts() -> float:
     return time.monotonic()
-
-
-def _pending_limit(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if not raw:
-        return default
-    try:
-        value = int(raw)
-    except ValueError:
-        raise RuntimeError(f"{name} must be an integer, got: {raw!r}")
-    if value <= 0:
-        raise RuntimeError(f"{name} must be a positive integer, got: {value}")
-    return value
 
 
 def normalize_repo(repo: str) -> str:
@@ -193,7 +179,8 @@ def list_issues(
 
     def collect():
         _validate_list_limit(limit)
-        pages = read_client.iter_issue_pages(repo, state=state, labels=labels, since=since, max_pages=max_pages)
+        raw_pages = read_client.iter_issue_pages(repo, state=state, labels=labels, since=since, max_pages=max_pages)
+        pages = ([issue for issue in page if "pull_request" not in issue] for page in raw_pages)
         issues, truncated = _collect_bounded(pages, limit)
         return {"issues": issues, "truncated": truncated}
 
@@ -232,7 +219,7 @@ def list_issue_candidates(
             return {"issues": issues, "truncated": True, "skipped": skipped}
         return {"issues": issues, "truncated": False, "skipped": skipped}
 
-    return _run_read_tool(dsn, "list_issues", repo, None, arguments, initiator, collect)
+    return _run_read_tool(dsn, "list_issue_candidates", repo, None, arguments, initiator, collect)
 
 
 def get_issue(dsn, read_client: GitHubReadClient, repo, issue_number, initiator, include_comments=True):
@@ -386,19 +373,24 @@ TRIAGE_OUTCOMES = ("proposed", "no_action", "error")
 
 
 def list_triage_skips(dsn, repo: str, max_error_attempts: int = DEFAULT_MAX_ERROR_ATTEMPTS) -> dict[int, str]:
-    # 'proposed' is included here, not just 'no_action', because a triage attempt can
-    # resolve to 'proposed' purely by deduping against a pending_actions row that some
-    # other initiator (a human, an MCP client) already queued. list_handled_issue_numbers
-    # only tracks rows the agent itself owns (requested_by LIKE 'agent:%'), so a
-    # dedup-only 'proposed' outcome is invisible there and, without this, the agent would
-    # re-classify the same unchanged issue with the model on every run forever.
     repo = normalize_repo(repo)
     with sync_connection(dsn) as conn:
         rows = conn.execute(
             """
-            SELECT issue_number, content_hash FROM triage_attempts
-            WHERE repo = %s
-              AND (outcome IN ('no_action', 'proposed') OR (outcome = 'error' AND attempts >= %s))
+            SELECT t.issue_number, t.content_hash FROM triage_attempts t
+            WHERE t.repo = %s
+              AND (
+                t.outcome = 'no_action'
+                OR (t.outcome = 'error' AND t.attempts >= %s)
+                OR (
+                    t.outcome = 'proposed'
+                    AND EXISTS (
+                        SELECT 1 FROM pending_actions p
+                        WHERE p.repo = t.repo AND p.issue_number = t.issue_number
+                          AND p.status IN ('pending', 'approving', 'needs_review', 'rejected', 'executed')
+                    )
+                )
+              )
             """,
             (repo, max_error_attempts),
         ).fetchall()
@@ -458,12 +450,6 @@ LOCK_NAMESPACE_INITIATOR = 1
 LOCK_NAMESPACE_ISSUE = 2
 
 
-def _clip(text: str, limit: int) -> str:
-    if len(text) <= limit:
-        return text
-    return f"{text[:limit]}[truncated {len(text) - limit} chars]"
-
-
 def build_source_excerpt(issue: dict) -> dict:
     title = issue.get("title") or ""
     body = issue.get("body") or ""
@@ -472,12 +458,12 @@ def build_source_excerpt(issue: dict) -> dict:
     shown_comments = [
         {
             "author": (c.get("user") or {}).get("login") or "unknown",
-            "body": _clip(c.get("body") or "", EXCERPT_COMMENT_CHARS),
+            "body": limits.clip(c.get("body") or "", EXCERPT_COMMENT_CHARS),
         }
         for c in recent
     ]
-    shown_title = _clip(title, EXCERPT_TITLE_CHARS)
-    shown_body = _clip(body, EXCERPT_BODY_CHARS)
+    shown_title = limits.clip(title, EXCERPT_TITLE_CHARS)
+    shown_body = limits.clip(body, EXCERPT_BODY_CHARS)
     all_matches = flag_matches(issue_plaintext(issue))
     shown_text = " ".join([shown_title, shown_body] + [c["body"] for c in shown_comments])
     visible_matches = set(flag_matches(shown_text))
@@ -524,12 +510,12 @@ def _enforce_pending_caps(
     per_issue_limit = (
         max_pending_per_issue
         if max_pending_per_issue is not None
-        else _pending_limit("MAX_PENDING_PER_ISSUE", DEFAULT_MAX_PENDING_PER_ISSUE)
+        else limits.positive_int_from_env("MAX_PENDING_PER_ISSUE", DEFAULT_MAX_PENDING_PER_ISSUE)
     )
     per_initiator_limit = (
         max_pending_per_initiator
         if max_pending_per_initiator is not None
-        else _pending_limit("MAX_PENDING_PER_INITIATOR", DEFAULT_MAX_PENDING_PER_INITIATOR)
+        else limits.positive_int_from_env("MAX_PENDING_PER_INITIATOR", DEFAULT_MAX_PENDING_PER_INITIATOR)
     )
 
     issue_row = conn.execute(
@@ -606,12 +592,16 @@ def _queue_proposal(
             )
 
             snapshot_issue = prefetched_issue if prefetched_issue is not None else read_client.get_issue(repo, issue_number)
+            if "pull_request" in snapshot_issue:
+                raise ValidationError(
+                    f"{repo}#{issue_number} is a pull request; proposals apply to issues only"
+                )
             if state_check is not None:
                 state_check(snapshot_issue, arguments)
             snapshot = _snapshot_from_issue(snapshot_issue)
             excerpt = build_source_excerpt(snapshot_issue)
             heuristic_flagged = heuristic_flagged or bool(excerpt["flag_matches"])
-            stored_rationale = _clip(rationale, RATIONALE_MAX_CHARS) if rationale else None
+            stored_rationale = limits.clip(rationale, RATIONALE_MAX_CHARS) if rationale else None
 
             with conn.transaction():
                 conn.execute(

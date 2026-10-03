@@ -1,14 +1,10 @@
+from issueops import limits
+
 LIST_BODY_CHARS = 500
 DETAIL_BODY_CHARS = 12000
 DETAIL_COMMENT_CHARS = 2500
 DETAIL_MAX_COMMENTS = 30
 TITLE_CHARS = 300
-
-
-def _clip(text: str, limit: int) -> str:
-    if len(text) <= limit:
-        return text
-    return f"{text[:limit]}[truncated {len(text) - limit} chars]"
 
 
 def _login(user) -> str | None:
@@ -33,7 +29,7 @@ def _logins(users) -> list[str]:
 def summarize_issue(issue: dict, body_chars: int = LIST_BODY_CHARS) -> dict:
     return {
         "number": issue.get("number"),
-        "title": _clip(issue.get("title") or "", TITLE_CHARS),
+        "title": limits.clip(issue.get("title") or "", TITLE_CHARS),
         "state": issue.get("state"),
         "state_reason": issue.get("state_reason"),
         "is_pull_request": "pull_request" in issue,
@@ -45,14 +41,14 @@ def summarize_issue(issue: dict, body_chars: int = LIST_BODY_CHARS) -> dict:
         "updated_at": issue.get("updated_at"),
         "closed_at": issue.get("closed_at"),
         "html_url": issue.get("html_url"),
-        "body_excerpt": _clip(issue.get("body") or "", body_chars),
+        "body_excerpt": limits.clip(issue.get("body") or "", body_chars),
     }
 
 
 def summarize_pull_request(pull: dict, body_chars: int = LIST_BODY_CHARS) -> dict:
     return {
         "number": pull.get("number"),
-        "title": _clip(pull.get("title") or "", TITLE_CHARS),
+        "title": limits.clip(pull.get("title") or "", TITLE_CHARS),
         "state": pull.get("state"),
         "draft": pull.get("draft"),
         "author": _login(pull.get("user")),
@@ -65,7 +61,7 @@ def summarize_pull_request(pull: dict, body_chars: int = LIST_BODY_CHARS) -> dic
         "closed_at": pull.get("closed_at"),
         "merged_at": pull.get("merged_at"),
         "html_url": pull.get("html_url"),
-        "body_excerpt": _clip(pull.get("body") or "", body_chars),
+        "body_excerpt": limits.clip(pull.get("body") or "", body_chars),
     }
 
 
@@ -91,7 +87,7 @@ def present_issue(issue: dict) -> dict:
             "author_association": comment.get("author_association"),
             "created_at": comment.get("created_at"),
             "updated_at": comment.get("updated_at"),
-            "body": _clip(comment.get("body") or "", DETAIL_COMMENT_CHARS),
+            "body": limits.clip(comment.get("body") or "", DETAIL_COMMENT_CHARS),
         }
         for comment in recent
     ]

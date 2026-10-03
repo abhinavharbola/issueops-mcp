@@ -1,9 +1,10 @@
 import re
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import requests
 
-GITHUB_API_BASE = "https://api.github.com"
+GITHUB_API_HOST = "api.github.com"
+GITHUB_API_BASE = f"https://{GITHUB_API_HOST}"
 
 _LINK_PATTERN = re.compile(r'<([^>]+)>\s*;\s*rel="([^"]+)"')
 
@@ -59,11 +60,12 @@ class _BaseClient:
         for url, rel in _LINK_PATTERN.findall(link_header):
             if rel != "next":
                 continue
-            if not url.startswith(GITHUB_API_BASE):
+            parsed = urlsplit(url)
+            if parsed.scheme != "https" or parsed.netloc != GITHUB_API_HOST:
                 raise GitHubAPIError(
                     response.status_code, f"pagination link points outside the GitHub API: {url}"
                 )
-            return url[len(GITHUB_API_BASE):]
+            return parsed.path + (f"?{parsed.query}" if parsed.query else "")
         return None
 
     def _paginated_iter(self, path: str, params: dict, max_pages: int = 20):
@@ -120,14 +122,6 @@ class GitHubReadClient(_BaseClient):
             params["since"] = since
         return params
 
-    def list_issues(
-        self, repo: str, state: str = "open", labels: list[str] | None = None,
-        since: str | None = None, max_pages: int = 20,
-    ):
-        return self._paginated_get(
-            f"/repos/{repo}/issues", self._issue_params(state, labels, since), max_pages=max_pages
-        )
-
     def iter_issue_pages(
         self, repo: str, state: str = "open", labels: list[str] | None = None,
         since: str | None = None, max_pages: int = 20,
@@ -156,14 +150,8 @@ class GitHubReadClient(_BaseClient):
             return comments
         return self._paginated_get(path, {}, max_pages=max_pages)
 
-    def list_repo_comments(self, repo: str, since: str):
-        return self._paginated_get(f"/repos/{repo}/issues/comments", {"since": since})
-
     def iter_repo_comment_pages(self, repo: str, since: str, max_pages: int = 20):
         return self._paginated_iter(f"/repos/{repo}/issues/comments", {"since": since}, max_pages=max_pages)
-
-    def list_pull_requests(self, repo: str, state: str = "open"):
-        return self._paginated_get(f"/repos/{repo}/pulls", {"state": state})
 
     def iter_pull_request_pages(self, repo: str, state: str = "open", max_pages: int = 20):
         return self._paginated_iter(f"/repos/{repo}/pulls", {"state": state}, max_pages=max_pages)

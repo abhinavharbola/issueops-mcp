@@ -40,6 +40,17 @@ def _load_env_file(include_write_pat: bool) -> None:
         os.environ.setdefault(key, value)
 
 
+def load_neon_dsn() -> str:
+    global _write_pat_dropped_in_process
+    _load_env_file(include_write_pat=False)
+    os.environ.pop(WRITE_PAT_NAME, None)
+    _write_pat_dropped_in_process = True
+    dsn = os.environ.get("NEON_DSN")
+    if not dsn:
+        raise RuntimeError("missing required environment variable: NEON_DSN")
+    return dsn
+
+
 def load_config(require_write_pat: bool = False, require_groq: bool = False) -> Config:
     global _write_pat_dropped_in_process
 
@@ -49,17 +60,7 @@ def load_config(require_write_pat: bool = False, require_groq: bool = False) -> 
             raise RuntimeError(f"missing required environment variable: {name}")
         return value
 
-    def optional_int(name: str, default: int) -> int:
-        raw = os.environ.get(name)
-        if not raw:
-            return default
-        try:
-            value = int(raw)
-        except ValueError:
-            raise RuntimeError(f"{name} must be an integer, got: {raw!r}")
-        if value <= 0:
-            raise RuntimeError(f"{name} must be a positive integer, got: {value}")
-        return value
+    optional_int = limits.positive_int_from_env
 
     if require_write_pat and _write_pat_dropped_in_process:
         raise RuntimeError(
@@ -90,7 +91,11 @@ def load_config(require_write_pat: bool = False, require_groq: bool = False) -> 
         logfire_token=os.environ.get("LOGFIRE_TOKEN") or None,
         pending_action_ttl_hours=optional_int("PENDING_ACTION_TTL_HOURS", 48),
         stuck_approving_recovery_minutes=optional_int("STUCK_APPROVING_RECOVERY_MINUTES", 10),
-        comment_body_max_chars=optional_int("COMMENT_BODY_MAX_CHARS", limits.COMMENT_BODY_MAX_CHARS_DEFAULT),
+        comment_body_max_chars=optional_int(
+            "COMMENT_BODY_MAX_CHARS",
+            limits.COMMENT_BODY_MAX_CHARS_DEFAULT,
+            maximum=limits.COMMENT_BODY_MAX_CHARS_CEILING,
+        ),
         max_pending_per_issue=optional_int("MAX_PENDING_PER_ISSUE", limits.MAX_PENDING_PER_ISSUE_DEFAULT),
         max_pending_per_initiator=optional_int(
             "MAX_PENDING_PER_INITIATOR", limits.MAX_PENDING_PER_INITIATOR_DEFAULT
