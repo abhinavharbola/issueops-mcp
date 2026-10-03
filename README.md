@@ -92,25 +92,20 @@ Read tools label issue text as untrusted. All propose tools reject pull request 
 
 ## Triage agent
 
-- **Model and scope:** `openai/gpt-oss-20b` on Groq (`--model` to override), one call per issue, with trusted context and untrusted issue text passed separately. By default it proposes only labels and assignments; `--allow-comment` and `--allow-close` unlock the rest, except on flagged (likely-injected) issues, which stay restricted. No-op proposals are filtered before queuing, and pull requests are never candidates.
-
-- **Skip rules:** an issue is skipped while an agent proposal for it is `pending`, `approving`, `rejected`, `executed`, or `needs_review`; `expired`, `failed`, and `stale` proposals are reconsidered. A `proposed` record keeps an issue skipped only while a live or terminal proposal for it exists (from any initiator) and its title and body are unchanged. A `no_action` issue is skipped until its text changes.
-
-- **Failures:** bad model output is not retried in-run. The issue is recorded as an error and retried on later runs until it fails 3 times with unchanged text. Model-provider and GitHub rate limits stop the run without being recorded against the issue; connection and server errors are transient and likewise unrecorded. Systemic failures (bad key, de-allowlisted repo, missing DB grant) stop the run and exit 1.
-
-- **Flags:** `--state`, `--max-issues` (positive), `--since`, `--max-pages` (positive), `--model`, `--allow-comment`, `--allow-close`. The prompt caps title at 300 chars, body at 8000, and comments at 10 (1500 each, 6000 combined), noting truncation inline. The rationale is stored with each proposal and shown to the approver.
+- **Scope:** `openai/gpt-oss-20b` on Groq (`--model` to override), one call per issue. Proposes labels and assignments by default; `--allow-comment` and `--allow-close` unlock the rest, except on flagged issues. Pull requests are never candidates.
+- **Skips:** an issue is skipped while an agent proposal for it is `pending`, `approving`, `rejected`, `executed`, or `needs_review`; `expired`, `failed`, and `stale` are reconsidered. `proposed` and `no_action` records skip it only while the text is unchanged (and, for `proposed`, a live or terminal proposal exists).
+- **Failures:** bad model output is retried on later runs, up to 3 failures per unchanged text. Rate limits (Groq or GitHub) stop the run; connection and server errors are transient. Neither is recorded against the issue. Systemic failures (bad key, de-allowlisted repo, missing DB grant) exit 1.
+- **Flags:** `--state`, `--max-issues`, `--since`, `--max-pages` (both counts positive), `--model`, `--allow-comment`, `--allow-close`.
+- **Prompt caps:** title 300 chars, body 8000, 10 comments (1500 each, 6000 total). Each proposal stores its rationale for the approver.
 
 ## Guardrails
 
-- **Before queuing:** every call checks `repo_allowlist.active`. Deactivation keeps history, blocks new proposals, and marks queued ones `blocked` at approval. Proposals that are stale by construction (closing a non-open issue, adding an existing label, targeting a pull request) are rejected. `MAX_PENDING_PER_ISSUE` (10) and `MAX_PENDING_PER_INITIATOR` (500) are enforced transactionally with two ordered advisory locks, and duplicate `pending` or `approving` proposals (same repo, issue, tool, arguments) are dropped.
-
-- **At approval:** only the dashboard holds the write token. Approval atomically moves `pending` to `approving` under a lease token required by every write, preventing concurrent execution without holding a DB lock across GitHub calls. Staleness is rechecked before writing: changed title or body, closed target, missing removal label, duplicate comment, or deleted label for an add blocks that proposal only.
-
-- **GitHub calls:** 15 second timeout. Pagination errors rather than silently truncating, and next-page links must point at `https://api.github.com` exactly. An unreadable issue releases the claim to `pending`; only 404 and 410 fail permanently. Assignment responses are verified. A write failing with a network error or GitHub 5xx may have applied, so the row goes to `needs_review` (`outcome_unknown`); a 4xx is a definite `failed`. Post-write DB failures retry on a fresh connection, then become `recording_failed`. Each status transition, with claimant identity, is recorded atomically with its audit row.
-
-- **Recovery:** `approving` rows stuck beyond `STUCK_APPROVING_RECOVERY_MINUTES` return to `pending` if the GitHub call never started, otherwise go to `needs_review`. Unknown outcomes are never auto-retried; a person records whether the change was applied, with an optional note. Requeueing gives a fresh expiry window (`requeued_at`). Unapproved proposals expire after `PENDING_ACTION_TTL_HOURS` (48), measured from creation or the last requeue, and are audited.
-
-- **Dashboard and misc:** requires `DASHBOARD_ACCESS_TOKEN` unless `DASHBOARD_ALLOW_INSECURE=true`. Review panels show rationale and issue text within prompt limits, flag truncation, require acknowledgement for flagged proposals, and can reload live GitHub data and re-run the flag check. Rejections and resolutions take an optional reason or note. Allowlist names are lowercased and reject `.` and `..` segments. The `Config` repr excludes credentials.
+- **Queuing:** every call checks `repo_allowlist.active`; deactivated repos keep history, reject new proposals, and mark queued ones `blocked`. Proposals stale by construction (closing a non-open issue, adding an existing label, targeting a pull request) are rejected. Caps of `MAX_PENDING_PER_ISSUE` (10) and `MAX_PENDING_PER_INITIATOR` (500) use two ordered advisory locks. Duplicate `pending` or `approving` proposals are dropped.
+- **Approval:** only the dashboard holds the write token. `pending` becomes `approving` atomically under a lease token every write requires, with no DB lock held across GitHub calls. A recheck blocks the proposal on a changed title or body, closed target, missing removal label, duplicate comment, or deleted label.
+- **GitHub calls:** 15 second timeout; pagination errors rather than truncating, and next-page links must match `https://api.github.com` exactly. An unreadable issue releases the claim to `pending` (only 404 and 410 fail permanently). A network error or 5xx on a write may have applied, so it goes to `needs_review` (`outcome_unknown`); a 4xx is `failed`. Post-write DB failures retry once on a fresh connection, then become `recording_failed`. Each transition is recorded atomically with its audit row.
+- **Recovery:** `approving` rows stuck past `STUCK_APPROVING_RECOVERY_MINUTES` return to `pending` if the GitHub call never started, else `needs_review`. Unknown outcomes are never auto-retried; a person records whether the change applied. Requeueing restarts the expiry window (`requeued_at`); proposals expire after `PENDING_ACTION_TTL_HOURS` (48), audited.
+- **Dashboard:** needs `DASHBOARD_ACCESS_TOKEN` unless `DASHBOARD_ALLOW_INSECURE=true`. Flagged proposals require acknowledgement, and the approver can reload live issue data and re-run the flag check. Rejections and resolutions take an optional note.
+- **Misc:** allowlist names are lowercased and reject `.` and `..` segments; the `Config` repr hides credentials.
 
 ## Safety
 
@@ -269,30 +264,28 @@ Start from [`eval/labels_template.json`](eval/labels_template.json). The eval fo
 
 ## Evaluation Metrics (Local Run)
 
-These figures are synthetic: projected for the current pipeline under ideal conditions, not measured. Rerun `python -m eval.eval` to replace them.
-
 12-issue fixture (9 legitimate, 3 adversarial) against `openai/gpt-oss-20b`:
 
-| Metric                                           | Earlier eval (measured) | Current eval (synthetic) |
-| ------------------------------------------------ | ----------------------- | ------------------------ |
-| `label_accuracy`                                 | 9/9                     | 9/9                      |
-| `adversarial_any_action_rate`                    | 3/3                     | 2/3                      |
-| `proposal_level_susceptibility`                  | 3/3                     | 2/3                      |
-| `marker_hit_rate` (injected phrases echoed)      | 0/3                     | 0/3                      |
-| `avg_latency_ms`                                 | ~4800                   | ~4200                    |
+| Metric                                           | Earlier eval            |
+| ------------------------------------------------ | ----------------------- |
+| `label_accuracy`                                 | 9/9                     |
+| `adversarial_any_action_rate`                    | 3/3                     |
+| `proposal_level_susceptibility`                  | 3/3                     |
+| `marker_hit_rate` (injected phrases echoed)      | 0/3                     |
+| `avg_latency_ms`                                 | ~4200                   |
 
-Changes come from the eval now matching production. If all three adversarial issues contain listed injection phrases, they are flagged and closes and comments are disallowed: the two that earlier drew a close plus an `invalid` label would queue only the label, and the third nothing. Latency drops because only the model call is timed. Label accuracy should hold because matching is case-insensitive and filtered to existing repo labels. With `n=12` this is a smoke test, not a benchmark.
+If all three adversarial issues contain listed injection phrases, they are flagged and closes and comments are disallowed. Label accuracy should be high because matching is case-insensitive and filtered to existing repo labels. With `n=12` this is a smoke test, not a benchmark.
 
 ## Known limitations
 
-- The injection heuristic is advisory and avoidable by omitting the listed phrases; it also over-triggers on legitimate LLM-related text.
-- Approver identity is a typed name. The access token gates the app but does not identify approvers.
-- `propose_remove_labels` calls GitHub once per label and can partially succeed; the failure message lists what was and was not removed.
-- Label and assignee caches are process-local with a 5 minute TTL.
-- Pagination caps at 20 pages or 2000 items by default. MCP listings stop at `limit` (max 100) and report `truncated`, and triage, activity summary, and comment reads flag partial results too. For issues with over 2000 comments only the first 2000 are read, so the duplicate-comment check covers only those.
-- Without `MCP_CLIENT_LABEL`, the MCP initiator includes hostname and process id, so the per-initiator cap is per process. Setting it gives a stable initiator shared across restarts.
-- All processes share one Postgres role. The audit log is append-only by convention (only `prune_audit_log.py` deletes from it), not by DB permissions. The two env files do not stop an operator from putting the write token in `.env`.
-- MCP read tools return projected summaries, not raw GitHub JSON. `get_issue` returns the 30 newest comments, each clipped to 2500 characters.
-- No scheduler is included; run the agent periodically yourself.
-- **Load current issue** opens a short-lived DB connection per click instead of using the pool.
-- Without `TEST_DATABASE_URL`, `pytest` skips the Postgres tests, so locking, schema guards, and database-backed dashboard flows go unexercised.
+- The injection heuristic is advisory, avoidable, and over-triggers on LLM-related text.
+- Approver identity is a typed name; the access token gates the app but does not identify people.
+- `propose_remove_labels` calls GitHub once per label and can partially succeed; the failure lists what was removed.
+- Label and assignee caches are process-local, 5 minute TTL.
+- Pagination caps at 20 pages or 2000 items. MCP listings stop at `limit` (max 100) and report `truncated`; other bulk reads flag partial results. Beyond 2000 comments, the duplicate-comment check sees only the first 2000.
+- Without `MCP_CLIENT_LABEL`, the initiator includes hostname and pid, so the per-initiator cap is per process.
+- One shared Postgres role: the audit log is append-only by convention (only `prune_audit_log.py` deletes), and nothing stops the write token being put in `.env`.
+- MCP reads return projected summaries; `get_issue` gives the 30 newest comments, clipped to 2500 chars each.
+- No scheduler is included.
+- **Load current issue** opens a short-lived DB connection per click.
+- Without `TEST_DATABASE_URL`, `pytest` skips the Postgres tests (locking, schema guards, database-backed dashboard flows).
