@@ -1,0 +1,1 @@
+ALTER TABLE pending_actions ADD COLUMN IF NOT EXISTS requeued_at TIMESTAMPTZ;

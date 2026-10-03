@@ -6,7 +6,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from psycopg.types.json import Jsonb
 
-from issueops.config import load_config
+from issueops.config import load_neon_dsn
 from issueops.db import sync_connection
 
 
@@ -45,8 +45,7 @@ def main():
     if args.days <= 0:
         raise SystemExit("--days must be a positive integer")
 
-    config = load_config(require_write_pat=False)
-    print(f"deleted {prune(config.neon_dsn, args.days)} audit_log rows")
+    print(f"deleted {prune(load_neon_dsn(), args.days)} audit_log rows")
 
 
 if __name__ == "__main__":

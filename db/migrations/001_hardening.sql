@@ -1,7 +1,3 @@
--- Historical: already applied to any database bootstrapped from db/schema.sql, which
--- records this filename in schema_migrations. Kept for databases that were built up
--- from these incremental files instead, and for the historical record. New changes go
--- in new files here, applied with `python scripts/migrate.py`, not by editing this one.
 UPDATE repo_allowlist SET added_at = now() WHERE added_at IS NULL;
 ALTER TABLE repo_allowlist ALTER COLUMN added_at SET NOT NULL;
 

@@ -5,7 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from issueops.config import load_config
+from issueops.config import load_neon_dsn
 from issueops.db import sync_connection
 
 _REPO_NAME = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -55,18 +55,18 @@ def main():
     subparsers.add_parser("list")
 
     args = parser.parse_args()
-    config = load_config(require_write_pat=False)
+    dsn = load_neon_dsn()
 
     if args.command == "add":
-        add_repo(config.neon_dsn, args.repo)
+        add_repo(dsn, args.repo)
         print(f"added {args.repo.strip().lower()}")
     elif args.command == "deactivate":
-        if deactivate_repo(config.neon_dsn, args.repo):
+        if deactivate_repo(dsn, args.repo):
             print(f"deactivated {args.repo.strip().lower()}")
         else:
             raise SystemExit(f"{args.repo} is not in the allowlist")
     elif args.command == "list":
-        for row in list_repos(config.neon_dsn):
+        for row in list_repos(dsn):
             print(row)
 
 

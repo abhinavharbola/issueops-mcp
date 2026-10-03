@@ -3,10 +3,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from issueops.config import load_config
+from issueops.config import load_neon_dsn
 from issueops.db import sync_connection
 
 MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "db" / "migrations"
+MIGRATION_LOCK_KEY = 7242001
 
 
 def _ensure_migrations_table(conn):
@@ -28,23 +29,22 @@ def _applied_versions(conn) -> set[str]:
 def run_migrations(dsn: str) -> list[str]:
     applied = []
     with sync_connection(dsn) as conn:
-        _ensure_migrations_table(conn)
-        already_applied = _applied_versions(conn)
-        for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
-            version = path.name
-            if version in already_applied:
-                continue
-            sql = path.read_text()
-            with conn.transaction():
-                conn.execute(sql)
+        with conn.transaction():
+            conn.execute("SELECT pg_advisory_xact_lock(%s)", (MIGRATION_LOCK_KEY,))
+            _ensure_migrations_table(conn)
+            already_applied = _applied_versions(conn)
+            for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
+                version = path.name
+                if version in already_applied:
+                    continue
+                conn.execute(path.read_text())
                 conn.execute("INSERT INTO schema_migrations (version) VALUES (%s)", (version,))
-            applied.append(version)
+                applied.append(version)
     return applied
 
 
 def main():
-    config = load_config(require_write_pat=False)
-    applied = run_migrations(config.neon_dsn)
+    applied = run_migrations(load_neon_dsn())
     if applied:
         print(f"applied {len(applied)} migration(s): {', '.join(applied)}")
     else:
