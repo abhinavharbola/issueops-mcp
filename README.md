@@ -140,18 +140,56 @@ Every transition is written atomically with its audit row.
 
 Issue titles, bodies, and comments are untrusted. The classifier prompt wraps them in `<untrusted_issue_content>` markers, strips any copy of those markers first, and tells the model to treat the content as data. MCP tool descriptions carry the same warning. A phrase check (`is_heuristically_flagged`, after Unicode normalization and zero-width-character removal) flags proposals in the dashboard and blocks agent comments and closes on flagged issues. It over-triggers by design and is not a security boundary. The real control is that every proposal is scoped to one issue and needs human approval.
 
-## Layout
-
-| Path | Contents |
-|---|---|
-| `issueops/` | Shared core: config and credential rules, GitHub clients, tools and validation, approval logic (`actions.py`), read projections, heuristics |
-| `agent/` | Classifier prompt and triage CLI |
-| `mcp_server/` | MCP server exposing the 10 tools |
-| `dashboard/` | Streamlit approval UI and token check |
-| `db/` | `schema.sql` baseline and `migrations/` |
-| `eval/` | Evaluation script and fixture template |
-| `scripts/` | Allowlist, migration, audit pruning, smoke-test client |
-| `tests/`, `conftest.py` | Unit tests (fake DB) and Postgres integration tests |
+## Project Structure
+```
+issueops-mcp/
+├── .github/workflows/ci.yml
+├── .streamlit/config.toml
+│
+├── issueops/
+│   ├── config.py                # env loading, credential rules, DSN-only loader
+│   ├── db.py                    # Postgres connection helper
+│   ├── limits.py                # text limits, clip helper, env integer parsing
+│   ├── github_client.py         # read and write GitHub clients, pagination guard
+│   ├── tools.py                 # read tools, propose tools, validation, caps, audit writes
+│   ├── actions.py               # approve, reject, expire, recover, resolve, lease handling
+│   ├── heuristics.py            # advisory injection-phrase check
+│   ├── projection.py            # slims and bounds what the MCP read tools return
+│   └── observability.py         # optional Logfire setup
+│
+├── agent/
+│   ├── prompts.py               # classifier prompt, trusted context, untrusted block
+│   └── triage.py                # triage agent and CLI
+│
+├── mcp_server/server.py         # MCP server exposing the 10 tools
+├── dashboard/
+│   ├── app.py                   # Streamlit approval UI and audit log view
+│   └── auth.py                  # access token check
+│
+├── db/
+│   ├── schema.sql               # idempotent baseline: creates a fresh database or upgrades an existing one, and records every migration file below as applied
+│   └── migrations/              # incremental changes, applied and tracked by scripts/migrate.py
+│
+├── eval/
+│   ├── eval.py                  # classification, adversarial, and audit-consistency checks
+│   └── labels_template.json     # fixture format
+│
+├── scripts/
+│   ├── allowlist.py             # add, deactivate, list allowlisted repos
+│   ├── migrate.py               # applies db/migrations/*.sql not yet recorded in schema_migrations
+│   ├── prune_audit_log.py       # delete audit rows older than N days
+│   └── custom_client.py         # call one MCP tool from the command line
+│
+├── assets/
+├── tests/                       # unit tests plus Postgres integration tests
+│
+├── conftest.py                  # fake DB used by the unit tests
+├── .env.example
+├── .env.dashboard.example
+├── .gitignore
+├── requirements.txt
+└── README.md
+```
 
 ## Getting started
 
