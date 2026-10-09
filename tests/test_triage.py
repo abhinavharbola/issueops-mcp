@@ -21,9 +21,50 @@ def test_sanitize_keeps_a_fully_valid_classification():
         "comment": "thanks",
         "close_reason": "completed",
         "assign_to": "octocat",
+        "suspected_injection": False,
         "rationale": "clear bug report",
     }
     assert _sanitize_classification(data) == data
+
+
+def test_sanitize_defaults_suspected_injection_to_false_and_accepts_true_and_the_string_true():
+    assert _sanitize_classification({"labels_to_add": []})["suspected_injection"] is False
+    assert _sanitize_classification({"suspected_injection": "false"})["suspected_injection"] is False
+    assert _sanitize_classification({"suspected_injection": 1})["suspected_injection"] is False
+    assert _sanitize_classification({"suspected_injection": True})["suspected_injection"] is True
+    assert _sanitize_classification({"suspected_injection": " True "})["suspected_injection"] is True
+
+
+def test_plan_drops_comment_close_and_assign_when_injection_is_suspected():
+    classification = {
+        "labels_to_add": ["invalid"],
+        "comment": "done",
+        "close_reason": "completed",
+        "assign_to": "octocat",
+        "suspected_injection": True,
+    }
+    plan = _plan_from_classification(
+        classification, "owner/repo", 1,
+        repo_labels=["invalid"], assignable=["octocat"], allow_comment=True, allow_close=True,
+    )
+    assert [name for name, _ in plan] == ["propose_add_labels"]
+
+
+def test_plan_keeps_comment_close_and_assign_when_injection_is_not_suspected():
+    classification = {
+        "labels_to_add": ["bug"],
+        "comment": "done",
+        "close_reason": "completed",
+        "assign_to": "octocat",
+        "suspected_injection": False,
+    }
+    plan = _plan_from_classification(
+        classification, "owner/repo", 1,
+        repo_labels=["bug"], assignable=["octocat"], allow_comment=True, allow_close=True,
+    )
+    assert [name for name, _ in plan] == [
+        "propose_add_labels", "propose_add_comment", "propose_close", "propose_assign",
+    ]
 
 
 def test_sanitize_drops_only_the_malformed_field():

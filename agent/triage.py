@@ -112,6 +112,11 @@ def _sanitize_classification(data) -> dict:
         dropped.append("assign_to")
         assign_to = None
 
+    suspected_injection = data.get("suspected_injection")
+    if isinstance(suspected_injection, str):
+        suspected_injection = suspected_injection.strip().lower() == "true"
+    suspected_injection = suspected_injection is True
+
     rationale = data.get("rationale")
     rationale = rationale if isinstance(rationale, str) else None
     if dropped:
@@ -123,6 +128,7 @@ def _sanitize_classification(data) -> dict:
         "comment": comment,
         "close_reason": close_reason,
         "assign_to": assign_to,
+        "suspected_injection": suspected_injection,
         "rationale": rationale,
     }
 
@@ -251,6 +257,11 @@ def _plan_from_classification(
 ) -> list[tuple[str, dict]]:
     plan = []
 
+    suspected = bool(classification.get("suspected_injection"))
+    if suspected:
+        allow_comment = False
+        allow_close = False
+
     labels = []
     seen = set()
     for label in classification.get("labels_to_add") or []:
@@ -274,7 +285,7 @@ def _plan_from_classification(
     if close_reason and allow_close and (issue is None or issue.get("state") == "open"):
         plan.append(("propose_close", {"reason": close_reason}))
 
-    assign_to = classification.get("assign_to")
+    assign_to = None if suspected else classification.get("assign_to")
     if assign_to:
         allowed = assignable is None or assign_to.lower() in {a.lower() for a in assignable}
         already = issue is not None and assign_to.lower() in _issue_assignee_logins(issue)
